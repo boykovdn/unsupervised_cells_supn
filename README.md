@@ -21,7 +21,18 @@ python train.py --config example_train_mean.yaml
 ```
 
 to train the encoder and mean-decoder. The paper parameters are in the default 
-config yaml file. The training will take a few hours.
+config yaml file. The training will take a few hours. Sometimes the VAE gets
+stuck in a local minimum, and the decoded mean is a single constant value
+across the image, so it is good to inspect the model training:
+
+```shell
+tensorboard --logdir ./experiments/mean_training --port 8008
+```
+
+Then check the "Images" tab in tensorboard by opening your browser and
+navigating to localhost:8008 (or whichever port you have specified). The mean
+should look right immediately after starting the training (there should be some
+variation across the images).
 
 Once the encoder and mean decoder are trained, train the supn decoder:
 
