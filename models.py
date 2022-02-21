@@ -64,7 +64,7 @@ def train(model, train_loader, optimizer, scheduler, loss_function, epochs, devi
         loss_function.step()
 
         if model_backup_path is not None:
-            torch.save(model, model_backup_path)
+            torch.save(model.state_dict(), model_backup_path)
 
     return model
 
@@ -357,6 +357,6 @@ def run(conf_):
 
     model = train(model, train_loader, optimizer, scheduler, loss, 
             EPOCHS, device=DEVICE, logging_function=logging_function_wrapper, 
-            model_backup_path="{}/{}/{}_backup.model".format(EXPERIMENT_DIR, EXPERIMENT_FOLDER, MODEL_NAME))
+            model_backup_path="{}/{}/{}_backup.state".format(EXPERIMENT_DIR, EXPERIMENT_FOLDER, MODEL_NAME))
 
-    torch.save(model, "{}/{}/{}.model".format(EXPERIMENT_DIR, EXPERIMENT_FOLDER, MODEL_NAME))
+    torch.save(model.state_dict(), "{}/{}/{}.state".format(EXPERIMENT_DIR, EXPERIMENT_FOLDER, MODEL_NAME))
