@@ -446,6 +446,7 @@ class IPE_autoencoder_mu_l(torch.nn.Module):
 
         assert dim_h is not None
 
+        self.connectivity = connectivity
         self.neighbourhood_size = 2*connectivity + 1
         self.num_nonzero_elems = (self.neighbourhood_size**2) // 2 + 1
 

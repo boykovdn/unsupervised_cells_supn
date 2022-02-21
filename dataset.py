@@ -208,20 +208,22 @@ class MvtecClass(torch.utils.data.Dataset):
     """
     
     def __init__(self, img_path, transforms=None, ext=".png", debug=False,
-            resize_to=(128,128), recursive_except=None, load_with_rgb=False):
+            resize_to=(128,128), recursive_except=None, load_with_rgb=False, fake_gt=False):
         r"""
         Args:
             :img_path: str/path. Points to the folder containing the images.
             :gt_path: str/path to ground truth masks. Should have the same names as in img_path.
             :load_with_rgb: bool, if True, will load images as [3,H,W] if they
-                are in colour, else will load each channel individually to be
-                treated as a separate datapoint.
+                are in colour, or will expand the gray image into [3,H,W]. If 
+                False, then grayscales will be loaded as grayscale [1,H,W], and 
+                RGBs will have each channel loaded as a separate image.
 
         Use to get the test set:
 
         #dset = MvtecClass("/u/homes/biv20/datasets/mvtek/bottle/test", ext=".png", recursive_except=['good'])
 
         """
+        self.fake_gt = fake_gt
         self.transforms = transforms
         self.img_path = img_path
         self.img_names = os.listdir(img_path)
@@ -253,27 +255,36 @@ class MvtecClass(torch.utils.data.Dataset):
     def process_imageio_input(self, img):
         r"""
         Adds the loaded image to the raw images list. It has to be turned into
-        a torch Tensor and since we work with grayscale, each channels to be 
-        treated as a separate image. 
+        a torch Tensor, and the image size (whether it is gray or rgb, along
+        with the load_with_rgb flag, determine how the image is loaded.
         """
         if len(img.shape) == 3 and not self.load_with_rgb:
-            # assuming the last dim is the channels.
+            # assuming the last dim is the channels, add each channel as 
+            # separate gray image.
             for ch in range(img.shape[-1]):
                 self.raw_imgs.append(
                     self.resize(
                         torch.from_numpy(rescale_to(img[...,ch], to=(0., 255.)).astype("uint8")).float().unsqueeze(0)))
-        else:
+        elif len(img.shape) == 2 and self.load_with_rgb:
+            # Fake rgb by expanding gray dim to 3 dims.
+            self.raw_imgs.append(
+                self.resize(
+                torch.from_numpy(rescale_to(img, to=(0., 255.)).astype("uint8")).float().unsqueeze(0)).expand(3,-1,-1))
+        elif len(img.shape) == 2 and not self.load_with_rgb:
             # Grayscale
-            if len(img.shape) == 2:
-                self.raw_imgs.append(
-                    self.resize(
-                    torch.from_numpy(rescale_to(img, to=(0., 255.)).astype("uint8")).float().unsqueeze(0)))
-            # Load rgb, or any number of other channels.
-            elif len(img.shape) == 3:
-                self.raw_imgs.append(
-                    self.resize(
-                    torch.from_numpy(rescale_to(img, to=(0., 255.)).astype("uint8")).float().transpose(1,2).transpose(0,1)))
+            self.raw_imgs.append(
+                self.resize(
+                torch.from_numpy(rescale_to(img, to=(0., 255.)).astype("uint8")).float().unsqueeze(0)))
  
+        elif len(img.shape) == 3:
+            # Load rgb, or any number of other channels.
+            self.raw_imgs.append(
+                self.resize(
+                torch.from_numpy(rescale_to(img, to=(0., 255.)).astype("uint8")).float().transpose(1,2).transpose(0,1)))
+
+        else:
+            raise Exception("Unrecognised image dim {} with rgb {}".format(
+                img.shape, self.load_with_rgb))
 
     def __len__(self):
         return self.dset_len
@@ -319,6 +330,7 @@ class MvtecClass(torch.utils.data.Dataset):
         if self.transforms is not None:
             img = self.transforms(img)
 
-        return img
-
-
+        if self.fake_gt:
+            return img, -1
+        else:
+            return img
