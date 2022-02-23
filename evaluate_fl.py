@@ -59,20 +59,31 @@ def scoring_table(true_labels, predicted_labels):
 
     return metrics
 
-def vae_model_scoring(dset_n, dset_a, model, scoring_func, device=0):
+def vae_model_scoring(dset_n, dset_a, model, scoring_func, device=0,
+        samples=100):
     r"""
     Calculates the auroc metric, or how well the model can detect anomalies, or
     classify class "normal" from class "anomalous".
+
+    Args:
+        :samples: int, how many samples from q_z to average in order to get the
+            estimate of the expected score.
     """
     def get_scores(dset, model, scoring_func):
         scores = []
         for dpoint, mask in tqdm(dset):
             dpoint = dpoint[None,].to(device) # [B,1,H,W]
             mask = mask[None]
-            x_mu, x_chol, _, _ = model(dpoint)
-            # In range [0,1], binary classification task between in or out of
-            # distribution.
-            score = scoring_func(x_mu, x_chol, dpoint, mask)
+
+            score_samples = []
+            for sid in tqdm(range(samples)):
+                x_mu, x_chol, _, _ = model(dpoint)
+                # In range [0,1], binary classification task between in or out of
+                # distribution.
+                score_sample = scoring_func(x_mu, x_chol, dpoint, mask)
+                score_samples.append(score_sample)
+
+            score = np.array(score_samples).mean()
             scores.append(score)
 
         return scores
@@ -183,22 +194,76 @@ class Restoration_model_wrap:
 
         return x_mu, x_chol, z_optim, None
 
-class Diag_model_wrap:
-
-    def __init__(self, model_diag):
-        self.model_diag = model_diag
-        self.connectivity = model_diag.connectivity
+class ModelWrapper:
+    r"""
+    Abstract class for a model wrapper.
+    """
+    def __init__(self, model):
+        self.model = model
+        self.connectivity = model.connectivity
 
     def zero_grad(self):
-        self.model_diag.zero_grad()
+        self.model.zero_grad()
+
+    def encoder(self, x):
+        return self.model.encoder(x)
 
     def mu_decoder(self, z):
-        return self.model_diag.mu_decoder(z)
+        raise NotImplementedError
 
     def var_decoder(self, z):
+        raise NotImplementedError
+    
+    def select_z(self, z_mu, z_logvar):
+        raise NotImplementedError
+
+    def __call__(self, x):
+        r"""
+        Common calculations for all models:
+
+        z_mu, z_logvar <--- Encoder(x)
+        z ~ N( z_mu, z_logvar )
+        x_mu, x_chol <--- Decoder(z)
+
+        But they could vary, e.g. for the restorative approach we do not sample
+        z, but rather select it using gradient descent for the ELBO.
+        """
+
+        z_mu, z_logvar = self.encoder( x )
+        z = self.select_z( z_mu, z_logvar )
+        x_mu = self.mu_decoder( z )
+        x_chol = self.var_decoder( z )
+
+        return x_mu, x_chol, z_mu, z_logvar
+
+
+
+class Diag_model_wrap(ModelWrapper):
+
+    def zero_grad(self):
+        self.model.zero_grad()
+
+    def mu_decoder(self, z):
+        return self.model.mu_decoder(z)
+
+    def select_z(self, z_mu, z_logvar):
+        r"""
+        Sample from MVN defined by the z predictions, much like the model
+        during training.
+        """
+        return self.model.reparametrize(z_mu, z_logvar.exp())
+
+    def var_decoder(self, z):
+        r"""
+        Output of the diagonal model has only one channel and is interpreted as
+        the log-diagonal of the covariance matrix. In order to be interpreted
+        as the log-diag of the Cholesky of the precision matrix, we need to
+        multiply by -0.5. The minus is for inverting the value (to precision) and 
+        the 0.5 for taking the square-root (Cholesky of a diagonal precision).
+        """
         # For diagonal model, output is a vector representing the log-diagonal 
         # of the covariance matrix.
-        x_logvar = self.model_diag.var_decoder(z)
+        x_logvar = self.model.var_decoder(z)
         device = z.device
         B,_,H,W = x_logvar.shape
         nonzeros = conn_to_nonzeros(self.connectivity)
@@ -207,51 +272,19 @@ class Diag_model_wrap:
 
         return x_chol
 
-    def __call__(self, x):
-        r"""
-        Output of the diagonal model has only one channel and is interpreted as
-        the log-diagonal of the covariance matrix. In order to be interpreted
-        as the log-diag of the Cholesky of the precision matrix, we need to
-        multiply by -0.5. The minus is for inverting the value (to precision) and 
-        the 0.5 for taking the square-root (Cholesky of a diagonal precision).
-        """
-        model_diag = self.model_diag
-        conn = self.connectivity
-
-        x_mu, x_logvar, z_mu, z_logvar = model_diag(x)
-        B,_,H,W = x_mu.shape
-
-        device = x_mu.device
-        nonzeros = conn_to_nonzeros(conn)
-        x_chol = torch.zeros(B, nonzeros, H, W).to(device)
-        x_chol[:,0] = -0.5*x_logvar[:,0]
-
-        return x_mu, x_chol, z_mu, z_logvar
-
-class L2_model_wrap:
-
-    def __init__(self, model_l2):
-        self.model_l2 = model_l2
-        self.connectivity = model_l2.connectivity
-
-    def zero_grad(self):
-        self.model_l2.zero_grad()
+class L2_model_wrap(ModelWrapper):
 
     def mu_decoder(self, z):
-        return self.model_l2.mu_decoder(z)
+        return self.model.mu_decoder(z)
+
+    def select_z(self, z_mu, z_logvar):
+        r"""
+        Sample from MVN defined by the z predictions, much like the model
+        during training.
+        """
+        return self.model.reparametrize(z_mu, z_logvar.exp())
 
     def var_decoder(self, z, H=128, W=128):
-        conn = self.connectivity
-        B,_ = z.shape
-        device = z.device
-        nonzeros = conn_to_nonzeros(conn)
-        x_chol = torch.zeros(B, nonzeros, H, W).to(device)
-
-        # Here x_logvar is completely discarded. It doesn't matter if the model was
-        # trained to predict something meaningful there or not.
-        return x_chol
-
-    def __call__(self, x):
         r"""
         Output of the L2 model is really only the mean, but it is interpreted as
         a spherical standard MVN (identity matrix as covariance). To reinterpret it
@@ -261,19 +294,15 @@ class L2_model_wrap:
         we pass a matrix of zeros, where the off-diagonals are interpreted as
         actual zeros, but the diagonal will be exponentiated later to have ones.
         """
-        model_l2 = self.model_l2
         conn = self.connectivity
-
-        x_mu, x_logvar, z_mu, z_logvar = model_l2(x)
-        B,_,H,W = x_mu.shape
-
-        device = x_mu.device
+        B,_ = z.shape
+        device = z.device
         nonzeros = conn_to_nonzeros(conn)
         x_chol = torch.zeros(B, nonzeros, H, W).to(device)
 
         # Here x_logvar is completely discarded. It doesn't matter if the model was
         # trained to predict something meaningful there or not.
-        return x_mu, x_chol, z_mu, z_logvar
+        return x_chol
 
 def load_model(config_path, input_size=(1,128,128), map_location='cuda:0'):
     r"""
@@ -383,19 +412,22 @@ def main():
     model_resto_diag = Restoration_model_wrap(model_diag_fwd)
     model_resto_l2 = Restoration_model_wrap(model_l2_fwd)
 
-    metrics_resto_supn = vae_model_scoring(dset_healthy, dset_infected, 
-                model_resto_supn, scoring_func, device=device_name)
-    metrics_resto_diag = vae_model_scoring(dset_healthy, dset_infected, 
-                model_resto_diag, scoring_func, device=device_name)
-    metrics_resto_l2 = vae_model_scoring(dset_healthy, dset_infected, 
-                model_resto_l2, scoring_func, device=device_name)
-
+    # Sampling is done for non-restorative methods (samples > 1).
     metrics_supn = vae_model_scoring(dset_healthy, dset_infected, 
-            model_supn, scoring_func, device=device_name)
+            model_supn, scoring_func, device=device_name, samples=10)
     metrics_diag = vae_model_scoring(dset_healthy, dset_infected, 
-            model_diag_fwd, scoring_func, device=device_name)
+            model_diag_fwd, scoring_func, device=device_name, samples=10)
     metrics_l2 = vae_model_scoring(dset_healthy, dset_infected, 
-            model_l2_fwd, scoring_func, device=device_name)
+            model_l2_fwd, scoring_func, device=device_name, samples=10)
+
+    # For restoration-based methods there is no sampling because the z becomes
+    # an optimized point estimate (samples = 1).
+    metrics_resto_supn = vae_model_scoring(dset_healthy, dset_infected, 
+                model_resto_supn, scoring_func, device=device_name, samples=1)
+    metrics_resto_diag = vae_model_scoring(dset_healthy, dset_infected, 
+                model_resto_diag, scoring_func, device=device_name, samples=1)
+    metrics_resto_l2 = vae_model_scoring(dset_healthy, dset_infected, 
+                model_resto_l2, scoring_func, device=device_name, samples=1)
 
     metrics = {
             'resto_supn' : metrics_resto_supn,
