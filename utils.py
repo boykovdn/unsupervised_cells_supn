@@ -3,6 +3,7 @@ from datetime import datetime
 import yaml
 import os
 import time
+from pathlib import Path
 
 import torch
 import torchvision.transforms as tv_transforms
@@ -11,9 +12,11 @@ from scipy.sparse import diags
 from scipy.linalg import solve_triangular
 from scipy.ndimage.morphology import distance_transform_edt
 
-from structured_uncertainty.losses import kl_divergence_unit_normal
-
 from torch.nn import functional as F
+
+from transforms import SigmoidScaleShift
+from model_blocks import (DiagChannelActivation,
+        IPE_autoencoder_mu_l)
 
 def get_timestamp_string():
     dtime = datetime.now()
@@ -65,318 +68,6 @@ def make_dirs_if_absent(DIR_LIST):
             print("creating dir {}".format(DIR))
             os.makedirs(DIR)
 
-def mahalanoubis_dist(x,mu,sparseL):
-    r"""
-    r.T cov-1 r
-    r.T (L.T L) r
-    (Lr).T (Lr)
-    """
-    Lr = apply_sparse_chol_rhs_matmul((x-mu),
-            log_diag_weights=sparseL[:,0].unsqueeze(1),
-            off_diag_weights=sparseL[:,1:],
-            local_connection_dist=1,
-            use_transpose=True)
-
-    return Lr.square()
-
-def conditional_mahalanobis(image, mean, chols, selection, conn=1, use_transpose=True):
-    r"""
-    args:
-        :image: [b,1,h,w]
-        :mean: [b,1,h,w]
-        :selection: [b,1,h,w] bool mask, the selected pixels which will be
-            the new random variables, conditioned on the rest of the pixels.
-        :chols: [b, nonzero ,h,w], nonzero is the number of nonzero elements
-            predicted in the cholesky matrix.
-        :conn: int, connectivity parameter.
-        :use_transpose: bool, default true, used upstream?
-
-    output:
-        conditional mahalanobis distance.
-    """
-    b, nonzero, h, w = chols.shape
-
-    assert b == 1, "batch > 1 not implemented"
-    assert conn == 1, "calculation only implemented for connectivity 1"
-    device = chols.device
-
-    idxs = torch.arange(h*w)
-
-    idxs_diag = torch.stack([idxs, idxs], dim=0)
-    vals_diag = chols[:,0].reshape(b, h*w).exp() # [b,h,w] -> [b,h*w]
-
-    idxs_right = torch.stack([idxs+1, idxs], dim=0)[:, :-1]
-    vals_right = chols[:,1].reshape(b, h*w)[:, :-1]
-
-    idxs_botleft = torch.stack([idxs + w - 1, idxs], dim=0)[:, :(h*w - w + 1)]
-    vals_botleft = chols[:,2].reshape(b, h*w)[:, :(h*w - w + 1)]
-
-    idxs_bot = torch.stack([idxs + w, idxs], dim=0)[:, :(h*w - w)] # [2, h*w]
-    vals_bot = chols[:,3].reshape(b, h*w)[:, :(h*w - w)]
-
-    idxs_botright = torch.stack([idxs + w + 1, idxs], dim=0)[:, :(h*w - w - 1)]
-    vals_botright = chols[:,4].reshape(b, h*w)[:, :(h*w - w - 1)]
-
-    idxs_out = torch.cat([idxs_diag, idxs_right, idxs_botleft, idxs_bot, idxs_botright], dim=1)
-    vals_out = torch.cat([vals_diag, vals_right, vals_botleft, vals_bot, vals_botright], dim=1)
-
-    ##### more efficient approach
-    # create coordinates array
-    hs_selection = torch.arange(h)
-    ws_selection = torch.arange(w)
-    idxs_selection = torch.zeros(2,h,w)
-    idxs_selection[0] = hs_selection.unsqueeze(1).expand(-1,w)
-    idxs_selection[1] = ws_selection.unsqueeze(0).expand(h,-1)
-
-    # select the hw coordinates from the passed selection
-    x_hw_selection = idxs_selection[:, selection[0,0]].long()
-    y_hw_selection = idxs_selection[:, ~selection[0,0]].long()
-
-    # build the roi cholesky matrix row subset
-    tri_off_diag_filters = build_off_diag_filters(
-            local_connection_dist=conn,
-            use_transpose=use_transpose,
-            device=device)
-
-    offdiag_num_ = tri_off_diag_filters.shape[0] # number of offdiagonal elements
-    ks_ = tri_off_diag_filters.shape[-1] # kernel size
-    flipped_ = torch.flip(tri_off_diag_filters, [2,3])
-    transpose_filters = torch.zeros(offdiag_num_, offdiag_num_, ks_, ks_)
-
-    for pos_ in range(offdiag_num_):
-        transpose_filters[pos_, pos_] = flipped_[pos_, 0]
-
-    chol_offdiag_transpose = f.conv2d(chols[:,1:], transpose_filters, padding=conn, stride=1)
-
-    # todo is this correct? -- seems to agree with the slow method when converted to dense.
-    # flip along the channels, so that the diagonal becomes the last entry.
-    chol_transpose = torch.flip(chols.clone(), [1])
-    # replace the entries up to the last entry with the transposed entries.
-    # also flip the transposed entries because the order along ch has to be reversed.
-    chol_transpose[:,:-1] = torch.flip(chol_offdiag_transpose, [1])
-    
-    # Select x rows from L; the L representation has been made into 'row format',
-    # so that the vector at each (h,w) now represent rows of the L matrix rather
-    # than columns as the model originally predicts.
-    Lx_vals = chol_transpose[:, :, x_hw_selection[0], x_hw_selection[1]] # [B,offd, |x|]
-    Ly_vals = chol_transpose[:, :, y_hw_selection[0], y_hw_selection[1]] # [B,offd, |y|]
-
-    transp_enum = torch.flip(torch.Tensor([0, -1, -W+1, -W, -W-1]), [0]) # displacement from diagonal along rows
-    Lh_positions = (idxs_selection[0] * W + idxs_selection[1]).unsqueeze(0).expand(nonzero,-1,-1) # [nonzero, H,W]
-    Lw_positions = Lh_positions + transp_enum[:,None,None].expand(-1,H,W) # [nonzero,H,W]
-
-    select_x_Lh_positions = Lh_positions[:, x_hw_selection[0], x_hw_selection[1]] # [offd, |x|]
-    select_x_Lw_positions = Lw_positions[:, x_hw_selection[0], x_hw_selection[1]] # [offd, |x|]
-    select_y_Lh_positions = Lh_positions[:, y_hw_selection[0], y_hw_selection[1]] # [offd, |y|]
-    select_y_Lw_positions = Lw_positions[:, y_hw_selection[0], y_hw_selection[1]] # [offd, |y|]
-
-    re_enum_x = torch.arange(select_x_Lh_positions.shape[-1])[None,].expand(nonzero, -1)
-    re_enum_y = torch.arange(select_y_Lh_positions.shape[-1])[None,].expand(nonzero, -1)
-
-    tmp_x_unravel = torch.stack([
-        re_enum_x[None,None,].expand(B,-1,-1,-1),
-        select_x_Lw_positions[None,None,].expand(B,-1,-1,-1), 
-        Lx_vals[None,]], dim=1)[0,:,0].reshape(3,-1)
-    tmp_y_unravel = torch.stack([
-        re_enum_y[None,None,].expand(B,-1,-1,-1),
-        select_y_Lw_positions[None,None,].expand(B,-1,-1,-1), 
-        Ly_vals[None,]], dim=1)[0,:,0].reshape(3,-1)
-
-    tmp_x = tmp_x_unravel[:, torch.logical_and(tmp_x_unravel[0] >= 0, tmp_x_unravel[1] >= 0)]
-    tmp_y = tmp_y_unravel[:, torch.logical_and(tmp_y_unravel[0] >= 0, tmp_y_unravel[1] >= 0)]
-    Chol_x = torch.sparse_coo_tensor(tmp_x[0:2], tmp_x[2], (selection.sum(), H*W))
-    Chol_y = torch.sparse_coo_tensor(tmp_y[0:2], tmp_y[2], ((~selection).sum(), H*W))
-
-    Lambda_xx = torch.sparse.mm(Chol_x, Chol_x.transpose(0,1))
-    Lambda_xx_inv = torch.linalg.inv(Lambda_xx.to_dense())
-    Lambda_xy = torch.sparse.mm(Chol_x, Chol_y.transpose(0,1))
-
-    x_rows = idxs[selection[0,0].reshape(-1)].long()
-    y_rows = idxs[~selection[0,0].reshape(-1)].long()
-    residual = (image - mean)[0,0].reshape(-1)
-    rx, ry = residual[x_rows], residual[y_rows]
-
-    Lxy = torch.sparse.mm(Lambda_xy, ry.unsqueeze(-1)) # LxLy^T ry
-    Lxx = torch.sparse.mm(Chol_x.transpose(0,1), rx.unsqueeze(-1)) # (hw,)
-    Lyy = torch.sparse.mm(Chol_y.transpose(0,1), ry.unsqueeze(-1)) # (hw,)
-
-    mah_term1 = Lxx.square().sum()
-    mah_term2 = -2 * (Lxx * Lyy).sum()
-    mah_term3 = Lxy.T @ Lambda_xx_inv @ Lxy
-
-    ##### Approach directly with sparse matrices
-    #sparse_chol = torch.sparse_coo_tensor(idxs_out, vals_out[0], (H*W, H*W))
-    #sparse_Lambda = torch.sparse.mm(sparse_chol, sparse_chol.transpose(0,1))
-
-
-    #Lambda_xx_xy = sparse_Lambda.index_select(0, xx_rows)
-    #Lambda_xx = Lambda_xx_xy.index_select(1, xx_rows)
-    #Lambda_xy = Lambda_xx_xy.index_select(1, xy_rows)
-    #
-    #sch = sparse_chol.index_select(0, xx_rows)
-
-    #
-    #Lambda_xy_ry = torch.sparse.mm(Lambda_xy, ry.unsqueeze(-1))
-    #Lambda_xx_inv = torch.linalg.inv(Lambda_xx.to_dense())
-
-    ##### Calculate Mahalanobis distance #####
-
-    ## Mah Term 1 is the equivalent of the unconditional Mah dist for these pixels.
-    #mah_term1 = rx * torch.sparse.mm(Lambda_xx_fast, rx.unsqueeze(-1))[:,0]
-    #mah_term2 = 2 * (rx * Lambda_xy_ry)[:,0]
-    ## Mah Term 3 requires the inverse of the Lambda_xx matrix (dense).
-    #mah_term3 = (Lambda_xy_ry * (Lambda_xx_inv @ Lambda_xy_ry))[:,0]
-
-    #mah_term2 = -2 * Lxx
-
-    #import matplotlib.pyplot as plt
-    #fig,axes = plt.subplots(1,3)
-    #axes[0].imshow(mah_term1.reshape(10,10))
-    #axes[1].imshow(mah_term2.reshape(10,10))
-    #axes[2].imshow(mah_term3.reshape(10,10))
-    #plt.show()
-
-    conditional_mahalanobis = (mah_term1 + mah_term2 + mah_term3).sum()
-
-    #k_dim = selection.sum()
-    #logprob = -0.5 * conditional_mahalanobis - 0.5 * torch.logdet(Lambda_xx_inv) - 0.5 * k_dim * torch.log(torch.Tensor([2 * np.pi]))
-    #import pdb; pdb.set_trace()
-
-    return conditional_mahalanobis
-
-def conditional_nll(image, mean, chols, selection, conn=1, use_transpose=True):
-    r"""
-    Args:
-        :image: [B,1,H,W]
-        :mean: [B,1,H,W]
-        :selection: [B,1,H,W] bool mask, the selected pixels which will be
-            the new random variables, conditioned on the rest of the pixels.
-        :chols: [B, nonzero ,H,W], nonzero is the number of nonzero elements
-            predicted in the cholesky matrix.
-        :conn: int, connectivity parameter.
-        :use_transpose: bool, default True, used upstream?
-
-    Output:
-        Conditional Mahalanobis distance.
-    """
-    B, nonzero, H, W = chols.shape
-
-    assert B == 1, "Batch > 1 not implemented"
-    assert conn == 1, "Calculation only implemented for connectivity 1"
-    device = chols.device
-
-    idxs = torch.arange(H*W)
-
-    idxs_diag = torch.stack([idxs, idxs], dim=0)
-    vals_diag = chols[:,0].reshape(B, H*W).exp() # [B,H,W] -> [B,H*W]
-
-    idxs_right = torch.stack([idxs+1, idxs], dim=0)[:, :-1]
-    vals_right = chols[:,1].reshape(B, H*W)[:, :-1]
-
-    idxs_botleft = torch.stack([idxs + W - 1, idxs], dim=0)[:, :(H*W - W + 1)]
-    vals_botleft = chols[:,2].reshape(B, H*W)[:, :(H*W - W + 1)]
-
-    idxs_bot = torch.stack([idxs + W, idxs], dim=0)[:, :(H*W - W)] # [2, H*W]
-    vals_bot = chols[:,3].reshape(B, H*W)[:, :(H*W - W)]
-
-    idxs_botright = torch.stack([idxs + W + 1, idxs], dim=0)[:, :(H*W - W - 1)]
-    vals_botright = chols[:,4].reshape(B, H*W)[:, :(H*W - W - 1)]
-
-    idxs_out = torch.cat([idxs_diag, idxs_right, idxs_botleft, idxs_bot, idxs_botright], dim=1)
-    vals_out = torch.cat([vals_diag, vals_right, vals_botleft, vals_bot, vals_botright], dim=1)
-
-    ##### More efficient approach
-    # Create coordinates array
-    hs_selection = torch.arange(H)
-    ws_selection = torch.arange(W)
-    idxs_selection = torch.zeros(2,H,W)
-    idxs_selection[0] = hs_selection.unsqueeze(1).expand(-1,W)
-    idxs_selection[1] = ws_selection.unsqueeze(0).expand(H,-1)
-
-    # Select the hw coordinates from the passed selection
-    x_hw_selection = idxs_selection[:, selection[0,0]].long()
-    y_hw_selection = idxs_selection[:, ~selection[0,0]].long()
-
-    # Build the ROI Cholesky matrix row subset
-    tri_off_diag_filters = build_off_diag_filters(
-            local_connection_dist=conn,
-            use_transpose=use_transpose,
-            device=device)
-
-    offdiag_num_ = tri_off_diag_filters.shape[0] # number of offdiagonal elements
-    ks_ = tri_off_diag_filters.shape[-1] # kernel size
-    flipped_ = torch.flip(tri_off_diag_filters, [2,3])
-    transpose_filters = torch.zeros(offdiag_num_, offdiag_num_, ks_, ks_)
-
-    for pos_ in range(offdiag_num_):
-        transpose_filters[pos_, pos_] = flipped_[pos_, 0]
-
-    chol_offdiag_transpose = F.conv2d(chols[:,1:], transpose_filters, padding=conn, stride=1)
-
-    # TODO Is this correct? -- Seems to agree with the slow method when converted to dense.
-    # Flip along the channels, so that the diagonal becomes the last entry.
-    chol_transpose = torch.flip(chols.clone(), [1])
-    # Replace the entries up to the last entry with the transposed entries.
-    # Also flip the transposed entries because the order along ch has to be reversed.
-    chol_transpose[:,:-1] = torch.flip(chol_offdiag_transpose, [1])
-    
-    # Select x rows from L; the L representation has been made into 'row format',
-    # so that the vector at each (h,w) now represent rows of the L matrix rather
-    # than columns as the model originally predicts.
-    Lx_vals = chol_transpose[:, :, x_hw_selection[0], x_hw_selection[1]] # [B,offd, |x|]
-    Ly_vals = chol_transpose[:, :, y_hw_selection[0], y_hw_selection[1]] # [B,offd, |y|]
-
-    transp_enum = torch.flip(torch.Tensor([0, -1, -W+1, -W, -W-1]), [0]) # displacement from diagonal along rows
-    Lh_positions = (idxs_selection[0] * W + idxs_selection[1]).unsqueeze(0).expand(nonzero,-1,-1) # [nonzero, H,W]
-    Lw_positions = Lh_positions + transp_enum[:,None,None].expand(-1,H,W) # [nonzero,H,W]
-
-    select_x_Lh_positions = Lh_positions[:, x_hw_selection[0], x_hw_selection[1]] # [offd, |x|]
-    select_x_Lw_positions = Lw_positions[:, x_hw_selection[0], x_hw_selection[1]] # [offd, |x|]
-    select_y_Lh_positions = Lh_positions[:, y_hw_selection[0], y_hw_selection[1]] # [offd, |y|]
-    select_y_Lw_positions = Lw_positions[:, y_hw_selection[0], y_hw_selection[1]] # [offd, |y|]
-
-    re_enum_x = torch.arange(select_x_Lh_positions.shape[-1])[None,].expand(nonzero, -1)
-    re_enum_y = torch.arange(select_y_Lh_positions.shape[-1])[None,].expand(nonzero, -1)
-
-    tmp_x_unravel = torch.stack([
-        re_enum_x[None,None,].expand(B,-1,-1,-1),
-        select_x_Lw_positions[None,None,].expand(B,-1,-1,-1), 
-        Lx_vals[None,]], dim=1)[0,:,0].reshape(3,-1)
-    tmp_y_unravel = torch.stack([
-        re_enum_y[None,None,].expand(B,-1,-1,-1),
-        select_y_Lw_positions[None,None,].expand(B,-1,-1,-1), 
-        Ly_vals[None,]], dim=1)[0,:,0].reshape(3,-1)
-
-    tmp_x = tmp_x_unravel[:, torch.logical_and(tmp_x_unravel[0] >= 0, tmp_x_unravel[1] >= 0)]
-    tmp_y = tmp_y_unravel[:, torch.logical_and(tmp_y_unravel[0] >= 0, tmp_y_unravel[1] >= 0)]
-    Chol_x = torch.sparse_coo_tensor(tmp_x[0:2], tmp_x[2], (selection.sum(), H*W))
-    Chol_y = torch.sparse_coo_tensor(tmp_y[0:2], tmp_y[2], ((~selection).sum(), H*W))
-
-    Lambda_xx = torch.sparse.mm(Chol_x, Chol_x.transpose(0,1))
-    Lambda_xx_inv = torch.linalg.inv(Lambda_xx.to_dense())
-    Lambda_xy = torch.sparse.mm(Chol_x, Chol_y.transpose(0,1))
-
-    x_rows = idxs[selection[0,0].reshape(-1)].long()
-    y_rows = idxs[~selection[0,0].reshape(-1)].long()
-    residual = (image - mean)[0,0].reshape(-1)
-    rx, ry = residual[x_rows], residual[y_rows]
-
-    Lxy = torch.sparse.mm(Lambda_xy, ry.unsqueeze(-1)) # LxLy^T ry
-    Lxx = torch.sparse.mm(Chol_x.transpose(0,1), rx.unsqueeze(-1)) # (hw,)
-    Lyy = torch.sparse.mm(Chol_y.transpose(0,1), ry.unsqueeze(-1)) # (hw,)
-
-    mah_term1 = Lxx.square().sum()
-    mah_term2 = -2 * (Lxx * Lyy).sum()
-    mah_term3 = Lxy.T @ Lambda_xx_inv @ Lxy
-
-    conditional_mahalanobis = (mah_term1 + mah_term2 + mah_term3).sum()
-
-    k_dim = selection.sum()
-    # TODO Glitchy?
-    conditional_nll = 0.5 * conditional_mahalanobis - 0.5 * torch.logdet(Lambda_xx_inv) + 0.5 * k_dim * torch.log(torch.Tensor([2 * np.pi]))
-
-    return conditional_nll
-
 def get_coordinate_mask(mask):
     r"""
     Get coordinates of True elements.
@@ -412,68 +103,6 @@ def retile_mask(mask, tile_factor):
         tiled = torch.nn.functional.interpolate(tiled, scale_factor=2, mode='nearest')
 
     return tiled, coords
-
-def nonmax_suppression_tiles(scores, threshold=0.4, tile_side=4, bb_size=1):
-    r"""
-    Performs the nonmax suppression algorithm and outputs the filtered out 
-    bounding boxes, where the boxes are expanded tiles (iou can be calculated
-    from the coordinates).
-
-    Args:
-        :scores: [N,4], each box (N) holds (n, coord_h, coord_w, score),
-            where n is one of the image stack.
-        :threshold: float, parameter of the nonmax suppression, percent overlap,
-            if the overlap is greater than this, then the overlapping cells with
-            lower score will be filtered out.
-        :tile_side: int, how big the tiles are (squares).
-        :bb_size: int, how many times bigger the bounding box sizes are than
-            the small tiles.
-
-    Returns:
-        np.ndarray [Q, ]
-    """
-    images_indices = np.unique(scores[:,0])
-    bb_side = tile_side * bb_size
-
-    output_boxes = []
-    
-    # Calculate the nonmax suppression per frame:
-    for image_idx in images_indices:
-
-        # TODO Check why filtering not correct.
-        # Select the boxes of this frame from the input.
-        boxes_idx_mask = scores[:,0] == image_idx # [N,]
-        scores_idx_ = scores[boxes_idx_mask] # [M,4], M <= N
-        is_not_processed = np.ones(boxes_idx_mask.sum()).astype(bool) # [M,], init all to True
-
-        # Iterate until all boxes were either selected or suppressed.
-        while is_not_processed.sum() != 0:
-
-            # Get the max score box and the coordinate offset to the rest of the boxes.
-            max_score_idx = scores_idx_[:,-1].argmax() # int for indexing M
-            output_boxes.append(scores_idx_[max_score_idx]) # Appends [n,h,w,score] array.
-            delta_coords = scores_idx_[:, 1:-1] - scores_idx_[max_score_idx, 1:-1] # [M, 2]
-
-            # Mark the boxes in the neighbourhood which are to be suppressed.
-            # Intersection area is calculated by multiplying the intersection in
-            # each coordinate axis.
-            intersection = np.maximum(bb_side - np.abs(delta_coords), 0) # [M,2]
-            intersection = intersection[:,0] * intersection[:,1] # [M,]
-            union = 2 * bb_side**2 - intersection
-            iou_ = intersection / union # [M, 1] IOU between 'image_idx' and the rest.
-            suppression_mask = iou_ > threshold # [M,1] bool mask of boxes which will be suppressed.
-
-            # Only cells which were not suppressed in this iteration and have not
-            # been 'processed' previously, will be candidates in future iterations.
-            is_not_processed = np.logical_and(is_not_processed, ~suppression_mask)
-
-            # Set the scores of the 'processed' boxes (all selected or suppressed
-            # boxes so far) to 0, so that argmax ignores them (scores >= 0).
-            scores_idx_[~is_not_processed, -1] = 0.0
-
-    output_boxes = np.stack(output_boxes, axis=0)
-
-    return output_boxes
 
 def lhs_inverse_LT_matmul(image, mean, chols, conn=1, use_transpose=True, device='cpu', frame=1):
 
@@ -515,65 +144,6 @@ def lhs_inverse_LT_matmul(image, mean, chols, conn=1, use_transpose=True, device
     LT_inv_x = Chol_T_inv @ mean[0,0].reshape(-1)
 
     return LT_inv_x.reshape(H,W)
-
-def get_combi_metric(x, model, conn=1, kl_blur=3, kl_kernel=5):
-    r"""
-    The Combi metric used to get good results in the following work:
-
-    Unsupervised Anomaly Localization using Variational Auto-Encoders
-
-    Combi = | dKL/dx | * Rec
-
-    Where KL is the KL-divergence in the latent space and Rex is the
-    reconstruction loss.
-    """
-    gaussian_blur = tv_transforms.GaussianBlur(kl_kernel, sigma=kl_blur)
-
-    model.zero_grad()
-    x = x.detach()
-    x.requires_grad = True
-
-    x_mu, x_chol, z_mu, z_logvar = model(x)
-
-    kl = kl_divergence_unit_normal(z_mu, z_logvar)
-
-    nll = - get_log_prob_from_sparse_L_precision(
-                x.detach(), x_mu.detach(), conn,
-                x_chol[:,0,...].unsqueeze(1).detach(),
-                x_chol[:,1:,...].detach(),
-                pixelwise=True) # (B,)
- 
-    kl.backward() # Compute gradients.
-    # xgrad is the derivative of the KL divergence wrt each pixel in the input,
-    # and it acts as a saliency map - emphasizing on the more 'important' parts
-    # of the image.
-    xgrad = gaussian_blur(x.grad.detach().abs())
-
-    model.zero_grad()
-
-    return xgrad * nll
-
-def get_kl_saliency_map(x, model, conn=1, kl_blur=3, kl_kernel=5):
-    r"""
-    """
-    gaussian_blur = tv_transforms.GaussianBlur(kl_kernel, sigma=kl_blur)
-
-    model.zero_grad()
-    x = x.detach()
-    x.requires_grad = True
-
-    _, _, z_mu, z_logvar = model(x)
-
-    kl = kl_divergence_unit_normal(z_mu, z_logvar)
-
-    kl.backward() # Compute gradients.
-    xgrad = gaussian_blur(x.grad.detach())
-
-    model.zero_grad()
-
-    # xgrad is a saliency map (not normalized!)
-    return xgrad
-
 
 def build_off_diag_filters(local_connection_dist, use_transpose=True, device=None, dtype=torch.float):
     """Create the conv2d filter weights for the off-diagonal components of the sparse chol.
@@ -712,3 +282,353 @@ def get_log_prob_from_sparse_L_precision(x,
                +0.5 * log_det_term # Note positive since precision..
 
     return log_prob
+
+def load_model(config_path, input_size=(1,128,128), map_location='cuda:0', 
+        dict_passed=None, pretrained_mean=True):
+    r"""
+    Initialize model architecture from config file, then load the trained state
+    dict.
+
+    Args:
+        :config_path: Path or str, to the config file specifying the model params.
+        :input_size: tuple, (c,h,w) what size the input images are, channels
+            including (even though at this point model only works with
+            grayscale).
+        :map_location: str or torch.device, where to put the model.
+        :dict_passed: dict, if not None, will use this as the already loaded 
+            yaml dict rather than look for the file at :config_path:.
+    """
+    if dict_passed is None:
+        yaml_dict = {}
+        with open(config_path, "r") as yaml_config:
+            yaml_dict = yaml.load(yaml_config, Loader=yaml.Loader)
+    else:
+        yaml_dict = dict_passed
+
+    # Find the model state dict from the config file.
+    experiment_dir = Path(yaml_dict["EXPERIMENT_DIR"])
+    experiment_folder = Path(yaml_dict["EXPERIMENT_FOLDER"])
+    model_name = yaml_dict["MODEL_NAME"]
+
+    if pretrained_mean:
+        path_state_dict = yaml_dict["PRETRAINED_MODEL_PATH"]
+    else:
+        path_state_dict = experiment_dir / experiment_folder / "{}.state".format(model_name)
+
+    depth = yaml_dict["DEPTH"]
+    connectivity = yaml_dict["MODEL_CONNECTIVITY"]
+    encoding_dim = yaml_dict["ENCODING_DIMENSION"]
+    dim_h = yaml_dict["MODEL_DIM_H"]
+    encoder_kernel_size = yaml_dict["ENCODER_KERNEL_SIZE"]
+    batch_size = yaml_dict["BATCH_SIZE"]
+    sigmoid_scale = yaml_dict["SIGMOID_SCALE"]
+    sigmoid_shift = yaml_dict["SIGMOID_SHIFT"]
+
+    model = IPE_autoencoder_mu_l(
+            (batch_size, *input_size),
+            encoding_dim,
+            connectivity=connectivity,
+            depth=depth,
+            dim_h=dim_h,
+            final_mu_activation=None,
+            final_var_activation=(lambda :
+                    DiagChannelActivation(
+                        activation_maker=(
+                            lambda : SigmoidScaleShift(
+                                scale=sigmoid_scale,
+                                shift=sigmoid_shift)),
+                        diag_channel_idx=0)),
+                encoder_kernel_size=encoder_kernel_size
+            )
+
+    model = model.to(map_location)
+
+    state_dict = torch.load(path_state_dict)
+    model.load_state_dict(state_dict)
+    print("loaded model {}".format(path_state_dict))
+
+    return model
+
+def get_scores(images, model, scoring_func):
+    r"""
+    Args:
+        :images: [N,1,H,W] torch.Tensor
+        :model: torch.Module
+        :scoring_func: callable
+
+    """
+    scores = []
+    for dpoint, mask in tqdm(dset):
+        dpoint = dpoint[None,].to(device) # [B,1,H,W]
+        mask = mask[None]
+
+        score_samples = []
+        for sid in tqdm(range(samples)):
+            x_mu, x_chol, _, _ = model(dpoint)
+            # In range [0,1], binary classification task between in or out of
+            # distribution.
+            score_sample = scoring_func(x_mu, x_chol, dpoint, mask)
+            score_samples.append(score_sample)
+
+        score = np.array(score_samples).mean()
+        scores.append(score)
+
+    return scores
+
+def conn_to_nonzeros(conn):
+    neighbourhood_size = 2*conn + 1
+    nonzeros = (neighbourhood_size**2) // 2 + 1
+
+    return nonzeros
+
+class Restoration_model_wrap:
+
+    def __init__(self, model, step=0.01, n_steps=100):
+        self.model = model
+        self.connectivity = model.connectivity
+        self.step = step
+        self.n_steps = n_steps
+
+    def zero_grad(self):
+        self.model_diag.zero_grad()
+
+    def optimize_z(self, dpoint, model, step=0.01, n_steps=100):
+        r"""
+        """
+        conn = self.connectivity
+
+        x_mu, x_chol, z_mu, z_logvar = model(dpoint)
+
+        model.zero_grad()
+        z_mu = z_mu.detach()
+        z_logvar = z_logvar.detach()
+
+        # Sample from dist for the initialization point.
+        z_ = z_mu + z_logvar.exp() * torch.randn_like(z_logvar)
+        z_.requires_grad = True
+
+        optimizer = torch.optim.Adam([z_], lr=step)
+        deltas = []
+        for step_idx in range(n_steps):
+            x_mu = model.mu_decoder(z_)
+            x_chol = model.var_decoder(z_)
+            mah = mahalanobis_dist(dpoint, x_mu, x_chol, conn=conn)
+            mah.sum().backward()
+            optimizer.step()
+            with torch.no_grad():
+                deltas.append((z_.grad * step).square().sum())
+            optimizer.zero_grad()
+
+        return z_.detach()
+
+    def __call__(self, x):
+        r"""
+        Optimize the latent representation z to give the best image
+        reconstruction via gradient descent.
+        """
+        model = self.model
+        conn = self.connectivity
+
+        z_optim = self.optimize_z(x, model)
+        x_mu = model.mu_decoder(z_optim)
+        x_chol = model.var_decoder(z_optim)
+
+        return x_mu, x_chol, z_optim, None
+
+class ModelWrapper:
+    r"""
+    Abstract class for a model wrapper.
+    """
+    def __init__(self, model):
+        self.model = model
+        self.connectivity = model.connectivity
+
+    def zero_grad(self):
+        self.model.zero_grad()
+
+    def encoder(self, x):
+        return self.model.encoder(x)
+
+    def mu_decoder(self, z):
+        raise NotImplementedError
+
+    def var_decoder(self, z):
+        raise NotImplementedError
+    
+    def select_z(self, z_mu, z_logvar):
+        raise NotImplementedError
+
+    def __call__(self, x):
+        r"""
+        Common calculations for all models:
+
+        z_mu, z_logvar <--- Encoder(x)
+        z ~ N( z_mu, z_logvar )
+        x_mu, x_chol <--- Decoder(z)
+
+        But they could vary, e.g. for the restorative approach we do not sample
+        z, but rather select it using gradient descent for the ELBO.
+        """
+
+        z_mu, z_logvar = self.encoder( x )
+        z = self.select_z( z_mu, z_logvar )
+        x_mu = self.mu_decoder( z )
+        x_chol = self.var_decoder( z )
+
+        return x_mu, x_chol, z_mu, z_logvar
+
+class Diag_model_wrap(ModelWrapper):
+
+    def zero_grad(self):
+        self.model.zero_grad()
+
+    def mu_decoder(self, z):
+        return self.model.mu_decoder(z)
+
+    def select_z(self, z_mu, z_logvar):
+        r"""
+        Sample from MVN defined by the z predictions, much like the model
+        during training.
+        """
+        return self.model.reparametrize(z_mu, z_logvar.exp())
+
+    def var_decoder(self, z):
+        r"""
+        Output of the diagonal model has only one channel and is interpreted as
+        the log-diagonal of the covariance matrix. In order to be interpreted
+        as the log-diag of the Cholesky of the precision matrix, we need to
+        multiply by -0.5. The minus is for inverting the value (to precision) and 
+        the 0.5 for taking the square-root (Cholesky of a diagonal precision).
+        """
+        # For diagonal model, output is a vector representing the log-diagonal 
+        # of the covariance matrix.
+        x_logvar = self.model.var_decoder(z)
+        device = z.device
+        B,_,H,W = x_logvar.shape
+        nonzeros = conn_to_nonzeros(self.connectivity)
+        x_chol = torch.zeros(B, nonzeros, H, W).to(device)
+        x_chol[:,0] = -0.5*x_logvar[:,0]
+
+        return x_chol
+
+class L2_model_wrap(ModelWrapper):
+
+    def mu_decoder(self, z):
+        return self.model.mu_decoder(z)
+
+    def select_z(self, z_mu, z_logvar):
+        r"""
+        Sample from MVN defined by the z predictions, much like the model
+        during training.
+        """
+        return self.model.reparametrize(z_mu, z_logvar.exp())
+
+    def var_decoder(self, z, H=128, W=128):
+        r"""
+        Output of the L2 model is really only the mean, but it is interpreted as
+        a spherical standard MVN (identity matrix as covariance). To reinterpret it
+        as a cholesky output, we do the same as in 'diag_model_wrap', but it turns
+        out that the cholesky of the precision is also an identity matrix. Since 
+        the evaluation functions expect a Cholesky output with log-diagonal values,
+        we pass a matrix of zeros, where the off-diagonals are interpreted as
+        actual zeros, but the diagonal will be exponentiated later to have ones.
+        """
+        conn = self.connectivity
+        B,_ = z.shape
+        device = z.device
+        nonzeros = conn_to_nonzeros(conn)
+        x_chol = torch.zeros(B, nonzeros, H, W).to(device)
+
+        # Here x_logvar is completely discarded. It doesn't matter if the model was
+        # trained to predict something meaningful there or not.
+        return x_chol
+
+def run_through_vae_restoration(input_images, model_l2, model_diag, model_chol,
+        fixed_var, DEVICE=0, return_means=False, return_chols=False, 
+        return_diag_logvar=False):
+    r"""
+    Calculate the Mahalanobis distances using a restoration-based method.
+
+    Args:
+        :input_images: torch.Tensor [TP, 1, H, W]
+        :masks: [TP,1,H,W]
+    """
+    assert len(input_images.shape) == 4,\
+            "Got {} need [TP, 1, H, W]".format(input_images.shape)
+
+    conn = model_chol.connectivity
+    TEST_POINTS, _, H, W = input_images.shape
+    # TP (Test Points along the x axis) is the batch dimension.
+    inp_ = input_images.to(DEVICE)
+
+    # In: [TP,1,H,W], Out: [TP,*,H,W]
+    x_mu_l2_, x_var_l2_, _, _ = model_l2(inp_) # Wrapped model.
+    x_mu_diag_, x_var_diag_, _, _ = model_diag(inp_)
+    x_mu_chol_, x_var_chol_, _, _ = model_chol(inp_)
+
+    chols = x_var_chol_
+    means = (x_mu_diag_ + x_mu_chol_)/2 # diag and chol should have the same decoder
+    diag_logvars = x_var_diag_
+    L2 = mahalanobis_dist(inp_, x_mu_l2_, x_var_l2_)
+    Diag = mahalanobis_dist(inp_, x_mu_diag_, x_var_diag_)
+    Supn = mahalanobis_dist(inp_, x_mu_chol_, x_var_chol_)
+
+    if return_diag_logvar:
+        return L2.detach(), Diag.detach(), Supn.detach(), means.detach(), chols.detach(), diag_logvars.detach()
+    if return_chols:
+        return L2.detach(), Diag.detach(), Supn.detach(), means.detach(), chols.detach()
+    if return_means:
+        return L2.detach(), Diag.detach(), Supn.detach(), means.detach()
+    else:
+        return L2.detach(), Diag.detach(), Supn.detach()
+
+def mahalanobis_dist(x,mu,sparseL, conn=1):
+    r"""
+    r.T cov-1 r
+    r.T (L.T L) r
+    (Lr).T (Lr)
+    """
+    Lr = apply_sparse_chol_rhs_matmul((x-mu),
+            log_diag_weights=sparseL[:,0].unsqueeze(1),
+            off_diag_weights=sparseL[:,1:],
+            local_connection_dist=conn,
+            use_transpose=True)
+
+    return Lr.square()
+
+def get_ellipsoid_mask(out_shape, center, a=10., b=5., angle=0.3):
+    cos_ = torch.cos(torch.Tensor([angle])).item()
+    sin_ = torch.sin(torch.Tensor([angle])).item()
+    rot_ = torch.Tensor([[cos_, -sin_],
+            [sin_, cos_]]) # (2,2)
+
+    mask = torch.tensor(np.indices(out_shape))
+    dist_ = (mask - center[:,None,None])
+    dist_ = torch.einsum("ij,jkl->ikl", rot_,dist_)
+    dist_[0] /= a
+    dist_[1] /= b
+    dist_ = dist_.square().sum(0).sqrt()
+
+    mask = (dist_ < 1).bool()
+
+    return mask
+
+def get_ellipsoid_pattern(out_shape, center, a=10., b=5., angle=0.3):
+    r"""
+    """
+    mask = get_ellipsoid_mask(out_shape, center, a=a, b=b, angle=angle)
+    dt = distance_transform_edt(mask.numpy())
+    pattern = rescale_to(dt, to=(0,1))
+
+    return pattern
+
+def get_ellipsoid_noise(out_shape, center, a=10., b=5., angle=0.3, 
+        stdev=0.5):
+    r"""
+    """
+    mask = get_ellipsoid_mask(out_shape, center, a=a, b=b, angle=angle)
+    random_sample = torch.randn(mask.sum()) * stdev
+    pattern = torch.zeros(*out_shape)
+    pattern[mask] = random_sample
+
+    return pattern

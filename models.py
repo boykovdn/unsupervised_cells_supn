@@ -6,14 +6,14 @@ from transforms import (rescale_to,
                         SigmoidScaleShift)
 from utils import (parse_config_dict,
                    make_dirs_if_absent,
-                   mahalanoubis_dist)
+                   mahalanobis_dist,
+                   load_model)
 from losses import (AnnealedDiagonalElboLoss, 
                     AnnealedElboLoss,
                     FixedStdNllLoss)
 from model_blocks import (IPE_autoencoder_mu_l,
         DiagChannelActivation)
 from transforms import random_gaussian_noise
-from utils import mahalanoubis_dist
 
 import torch
 from collections import OrderedDict
@@ -90,7 +90,7 @@ def logging_function_rec(model, dset_tforms, iteration, summary_writer, device=0
         out_mu = model_outp_[0].detach()
         out_cov = model_outp_[1].detach()
         # Mahanoubis dist internally exponentiates the diagonal, so no need to do beforehand.
-        mah_dists = mahalanoubis_dist(inputs, out_mu, out_cov)
+        mah_dists = mahalanobis_dist(inputs, out_mu, out_cov)
 
     if out_cov.shape[1] > 1:
         out_diag = out_cov[:,0,...].unsqueeze(1).exp() # diag is constrained to positive
@@ -234,8 +234,17 @@ def run(conf_):
 
     # Below, dset[0] has the batch dimension added by us to initialize the model correctly
     if PRETRAINED_MODEL_PATH is not None:
-        model = torch.load(PRETRAINED_MODEL_PATH)
+        if isinstance(DEVICE, int):
+            map_loc = "cuda:{}".format(DEVICE)
+        else:
+            map_loc = DEVICE
+
+        # Below we pass 'config_path' as 'None' because we will not load the
+        # config from this path, but will rather pass it already loaded as the
+        # final kwarg.
+        model = load_model("None", map_location=map_loc, dict_passed=conf_)
         print("Loaded pre-trained model {}".format(PRETRAINED_MODEL_PATH))
+
     else:
         inp_size = dset._get_image_shape()
         spatial_ = inp_size[1:]

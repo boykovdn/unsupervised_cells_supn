@@ -150,11 +150,11 @@ class AnnealedDiagonalElboLoss(torch.nn.Module):
         device = x.device
 
         if self.offdiag_passed:
-            log_sigma = x_logvar[:,0].flatten(start_dim=1) # [B, H*W]
+            log_sigma_sq = x_logvar[:,0].flatten(start_dim=1) # [B, H*W]
         else:
-            log_sigma = x_logvar.flatten(start_dim=1) # [B, H*W]
+            log_sigma_sq = x_logvar.flatten(start_dim=1) # [B, H*W]
 
-        sigma = log_sigma.exp()
+        sigma_sq = log_sigma_sq.exp()
     
         # Negative Log-Likelihood
         # TODO RM prints below
@@ -166,7 +166,7 @@ class AnnealedDiagonalElboLoss(torch.nn.Module):
         constant_term = im_size_w * im_size_h * torch.log(torch.Tensor([2.0 * np.pi]))
         constant_term = constant_term.to(device)
         nll_ = 0.5 * (torch.einsum("bi,bi->b", r, 
-            ((1/(sigma + self.eps_)) * r)) + 0.5 * log_sigma.sum(1)) + 0.5 * constant_term
+            ((1/(sigma_sq + self.eps_)) * r)) + 0.5 * log_sigma_sq.sum(1)) + 0.5 * constant_term
        
         # Kullback-Leibler Div
         kl_ = kl_divergence_unit_normal(z_mu, z_logvar)

@@ -1,6 +1,5 @@
 from utils import (parse_config_dict,
-                   make_dirs_if_absent,
-                   mahalanoubis_dist)
+                   make_dirs_if_absent)
 from models import run
 
 def main():
