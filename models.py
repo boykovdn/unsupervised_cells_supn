@@ -40,7 +40,10 @@ def logging_function(decoders, loss, iteration, summary_writer, log_image=False)
         
         summary_writer.add_images("Sampled", rescale_to(image_sample, to=(0,1)), iteration, dataformats="NCHW")
 
-def train(model, train_loader, optimizer, scheduler, loss_function, epochs, device=0, logging_function=None, image_logging_period=100, model_backup_path=None, hist_logging_period=3000):
+def train(model, train_loader, optimizer, loss_function, epochs, device=0, 
+        scheduler=None, logging_function=None, image_logging_period=100, 
+        model_backup_path=None, hist_logging_period=3000):
+
     model = model.to(device)
     iteration = 0
     for _ in range(epochs):
@@ -55,13 +58,12 @@ def train(model, train_loader, optimizer, scheduler, loss_function, epochs, devi
             with torch.no_grad():
                 if logging_function is not None:
                     log_image = iteration % image_logging_period == 0
-                    log_hist = iteration % hist_logging_period == 0
-                    logging_function(model, loss.item(), iteration, log_image, log_hist)
+                    logging_function(model, loss.item(), iteration, log_image)
 
                 iteration += 1
 
-        scheduler.step()
-        loss_function.step()
+        if scheduler is not None:
+            scheduler.step()
 
         if model_backup_path is not None:
             torch.save(model.state_dict(), model_backup_path)
@@ -147,11 +149,11 @@ def run(conf_):
     MODEL_CONNECTIVITY = conf_['MODEL_CONNECTIVITY']
     MODEL_DIM_H = conf_['MODEL_DIM_H']
     LEARNING_RATE = conf_['LEARNING_RATE']
-    WEIGHT_DECAY = conf_['WEIGHT_DECAY']
-    SHUFFLE_DATAPOINTS = conf_["SHUFFLE_DATAPOINTS"]
 
+    # These two scheduler params only used for training the encoder and mean.
     SCHEDULER_GAMMA = conf_['SCHEDULER_GAMMA']
     SCHEDULER_MILESTONES = conf_['SCHEDULER_MILESTONES']
+
     DEVICE = conf_['DEVICE']
 
     # L1 regularization of the covariance terms in the Cholesky matrix.
@@ -180,12 +182,6 @@ def run(conf_):
             'random_level_gaussian_blur' : tv_transforms.GaussianBlur(3,sigma=(0.1,2.0)),
             }
 
-    joint_transform_functions = {
-            'joint_random_cell_crop' : lambda x,gt : joint_random_cell_crop(x,gt, box_half_side=128//2),
-            'joint_misc_mask_to_long' : lambda x,gt : (x, gt.bool().long()),
-            'joint_cat_raw_gt_as_channel' : lambda x,gt : (torch.cat((x,gt), dim=0), gt)
-            }
-
     ### Create Composite transform objects from list in config file.
     if RAW_TRANSFORMS is not None:
         raw_tform_list = []
@@ -194,24 +190,18 @@ def run(conf_):
         tforms = tv_transforms.Compose(raw_tform_list)
     else: tforms = None
 
-    # Joint transforms not really used here.
-    tforms_joint = None
-    ####
-
     dset = CellCrops(RAW_PATH, transforms=tforms, load_to_gpu=DEVICE, debug=DEBUG)
     train_loader = torch.utils.data.DataLoader(dset, batch_size=BATCH_SIZE,
-        shuffle=SHUFFLE_DATAPOINTS, drop_last=True)
+        shuffle=True, drop_last=True)
 
     # Tensorboard logging
     summary_writer = SummaryWriter(log_dir="{}/{}".format(EXPERIMENT_DIR, EXPERIMENT_FOLDER))
 
-    def logging_function_wrapper(model, loss, it, log_image, log_hist):
+    def logging_function_wrapper(model, loss, it, log_image):
         r"""
         Called from the training loop, calls the other logging functions.
 
         :log_image: bool, whether to log images on this iteration
-        :log_hist: bool, whether to log histograms on this iteration (only 
-            works with certain datasets)
         :model: torch.nn.Module, the model, applied on some data to produce 
             visualizations at the current state
         :it: int, current iteration
@@ -257,7 +247,6 @@ def run(conf_):
                 connectivity=MODEL_CONNECTIVITY, 
                 depth=DEPTH, 
                 dim_h=MODEL_DIM_H,
-                final_mu_activation=None,
                 final_var_activation=(lambda : 
                     DiagChannelActivation(
                         activation_maker=(
@@ -267,52 +256,7 @@ def run(conf_):
                         diag_channel_idx=0)),
                 encoder_kernel_size=ENCODER_KERNEL_SIZE
                 )
-
-        print(model)
-   
-    # If model requires different optimizers and schedulers for ts different
-    # networks, the below classes help keep all of them synchronied. Sometimes
-    # we want to train different parts of the model with different learning
-    # rates or different algorithms.
-    class OptimizerList:
-        def __init__(self, optimizer_list):
-            self.optimizer_list = optimizer_list
-        def step(self):
-            for opt_ in self.optimizer_list:
-                opt_.step()
-        def zero_grad(self):
-            for opt_ in self.optimizer_list:
-                opt_.zero_grad()
-
-    class SchedulerList:
-        def __init__(self, scheduler_list):
-            self.scheduler_list = scheduler_list
-        def step(self):
-            for sch_ in self.scheduler_list:
-                sch_.step()
-            
-    optimizer_enc = torch.optim.Adam(
-            model.encoder.parameters(),
-            lr=LEARNING_RATE,
-            weight_decay=WEIGHT_DECAY)
-    optimizer_mu_dec = torch.optim.Adam(
-            model.mu_decoder.parameters(),
-            lr=LEARNING_RATE,
-            weight_decay=WEIGHT_DECAY)
-    optimizer_var_dec = torch.optim.Adam(
-            model.var_decoder.parameters(),
-            lr=LEARNING_RATE)
-
-    scheduler_enc = MultiStepLR(optimizer_enc, 
-            milestones=SCHEDULER_MILESTONES, gamma=SCHEDULER_GAMMA)
-    scheduler_mu_dec = MultiStepLR(optimizer_mu_dec, 
-            milestones=SCHEDULER_MILESTONES, 
-            gamma=SCHEDULER_GAMMA) 
-
-    # TODO Clean up optimizers and stagewise training!
-    optimizer = OptimizerList([optimizer_enc, optimizer_mu_dec, optimizer_var_dec])
-    scheduler = SchedulerList([scheduler_enc, scheduler_mu_dec])
-
+           
     class LoggingScalarListener(object):
         r"""
         Subscribes to a loss function which returns a single number as output,
@@ -343,29 +287,55 @@ def run(conf_):
         loss = AnnealedDiagonalElboLoss(
                 loss_logging_listener=LoggingScalarListener())
 
+        optimizer = torch.optim.Adam(
+                model.var_decoder.parameters(),
+                lr=LEARNING_RATE)
+
+        scheduler = None
+
     elif TRAINING_TYPE == 'supn':
         # Train Var decoder from the beginning, MIDL22.
         model.freeze([model.mu_decoder, model.encoder])
         model.unfreeze([model.var_decoder])
+
         loss = AnnealedElboLoss(
                 loss_logging_listener=LoggingScalarListener(),
                 l1_reg_weight=L1_REG_WEIGHT,
                 connectivity=MODEL_CONNECTIVITY)
 
+        optimizer = torch.optim.Adam(
+                model.var_decoder.parameters(),
+                lr=LEARNING_RATE)
+
+        scheduler = None
+
     elif TRAINING_TYPE == 'mean':
         # For MIDL experiments, 07122021.
         model.freeze([model.var_decoder])
         model.unfreeze([model.mu_decoder, model.encoder])
+
         loss = FixedStdNllLoss(
-                fixed_std=FIXED_VAR, # It is actually the variance not std
+                fixed_var=FIXED_VAR,
                 loss_logging_listener=LoggingScalarListener()
                 )
+
+        optimizer = torch.optim.Adam(
+            [{'params' : model.encoder.parameters()},
+             {'params' : model.mu_decoder.parameters()}], 
+            lr=LEARNING_RATE)
+
+        scheduler = MultiStepLR(
+                optimizer, 
+                milestones=SCHEDULER_MILESTONES, 
+                gamma=SCHEDULER_GAMMA)
 
     else:
         raise Exception("TRAINING TYPE {} not recognised, sorry! Please pass 'supn', 'mean', or 'diag'.".format(TRAINING_TYPE))
 
-    model = train(model, train_loader, optimizer, scheduler, loss, 
-            EPOCHS, device=DEVICE, logging_function=logging_function_wrapper, 
-            model_backup_path="{}/{}/{}_backup.state".format(EXPERIMENT_DIR, EXPERIMENT_FOLDER, MODEL_NAME))
+    model = train(model, train_loader, optimizer, loss, EPOCHS, 
+            device=DEVICE, logging_function=logging_function_wrapper, 
+            scheduler=scheduler,
+            model_backup_path="{}/{}/{}_backup.state".format(EXPERIMENT_DIR, 
+                EXPERIMENT_FOLDER, MODEL_NAME))
 
     torch.save(model.state_dict(), "{}/{}/{}.state".format(EXPERIMENT_DIR, EXPERIMENT_FOLDER, MODEL_NAME))
