@@ -24,8 +24,9 @@ from model_blocks import (DiagChannelActivation,
         IPE_autoencoder_mu_l)
 import argparse
 from pathlib import Path
+import matplotlib.pyplot as plt
 
-def scoring_table(true_labels, predicted_labels):
+def scoring_table(true_labels, predicted_labels, plot_curves=False, model_label=None):
     r"""
     Reports a couple of evaluation metrics.
 
@@ -48,10 +49,16 @@ def scoring_table(true_labels, predicted_labels):
     metrics['auprc'] = auprc
     metrics['auroc'] = auroc
 
+    if plot_curves:
+        fpr, tpr, thresh = roc_curve(true_labels, predicted_labels)
+        #precision, recall, thresh = precision_recall_curve(true_labels, predicted_labels)
+        plt.plot(fpr, tpr, color="blue", label=model_label)
+        #plt.plot(precision, recall, color="orange")
+
     return metrics
 
 def vae_model_scoring(dset_n, dset_a, model, scoring_func, device=0,
-        samples=100):
+        samples=100, model_label=None):
     r"""
     Calculates the auroc metric, or how well the model can detect anomalies, or
     classify class "normal" from class "anomalous".
@@ -60,8 +67,9 @@ def vae_model_scoring(dset_n, dset_a, model, scoring_func, device=0,
         :samples: int, how many samples from q_z to average in order to get the
             estimate of the expected score.
     """
-    def get_scores(dset, model, scoring_func):
+    def get_scores(dset, model, scoring_func, plot_convergence=False):
         scores = []
+        deltas_cumul = [] # TODO Remove
         for dpoint, mask in tqdm(dset):
             dpoint = dpoint[None,].to(device) # [B,1,H,W]
             mask = mask[None]
@@ -71,27 +79,37 @@ def vae_model_scoring(dset_n, dset_a, model, scoring_func, device=0,
                 x_mu, x_chol, _, _ = model(dpoint)
                 # In range [0,1], binary classification task between in or out of
                 # distribution.
-                score_sample = scoring_func(x_mu, x_chol, dpoint, mask)
+                score_sample = scoring_func(x_mu, x_chol, dpoint, mask, model.connectivity)
                 score_samples.append(score_sample)
 
             score = np.array(score_samples).mean()
             scores.append(score)
+            #deltas_cumul.append(torch.Tensor(model.deltas)) # TODO Remove
+
+        # TODO Temporary, to get convergence graphs
+        if plot_convergence:
+            deltas_cumul = torch.stack(deltas_cumul) # [DP, Optim_steps]
+            deltas_means = deltas_cumul.mean(0)
+            deltas_stds = deltas_cumul.std(0)
+            plt.fill_between(range(len(deltas_stds)), deltas_means - deltas_stds/2, 
+                    deltas_means + deltas_stds/2, alpha=0.5)
+            plt.plot(range(len(deltas_means)), deltas_means, linestyle="dotted", label=model_label)
 
         return scores
 
     anom_labels = np.ones(len(dset_a))
-    anom_scores = np.array(get_scores(dset_a, model, scoring_func))
+    anom_scores = np.array(get_scores(dset_a, model, scoring_func, plot_convergence=False)) # TODO
     norm_labels = np.zeros(len(dset_n))
     norm_scores = np.array(get_scores(dset_n, model, scoring_func))
 
     labels = np.concatenate((anom_labels, norm_labels))
     scores = np.concatenate((anom_scores, norm_scores))
 
-    metrics = scoring_table(labels, scores)
+    metrics = scoring_table(labels, scores, model_label=model_label)
 
     return metrics
 
-def scoring_func_outliers(x_mu, x_chol, x, mask, TILE_FACTOR, saliency_map=None):
+def scoring_func_outliers(x_mu, x_chol, x, mask, TILE_FACTOR, saliency_map=None, conn=1):
     r"""
     This function tiles the image and returns the highest score, which would
     correspond to the outlier if there is one.
@@ -113,7 +131,7 @@ def scoring_func_outliers(x_mu, x_chol, x, mask, TILE_FACTOR, saliency_map=None)
             slice_w = slice(coord_w, coord_w + tile_size)
             selection[..., slice_h, slice_w] = True
 
-            whitened_mah = mahalanobis_dist(x, x_mu, x_chol)
+            whitened_mah = mahalanobis_dist(x, x_mu, x_chol, conn=conn)
             whitened_mah = whitened_mah[selection].sum()
 
             tile_scores.append([ coord_h.item(), coord_w.item(), 
@@ -135,6 +153,8 @@ def main():
     # TILE_FACTOR is basically the size of a 2dpool-ing neighbourhood.
     TILE_FACTOR = 2
     
+    FL_FIXED_VAR = 0.11
+    
     DEVICE='0'
     device_name = 'cuda:{}'.format(DEVICE) if type(DEVICE) is int else 'cpu'
 
@@ -143,6 +163,7 @@ def main():
     parser.add_argument("--path_diag", type=str, help="Path to DIAG training config")
     args = parser.parse_args()
 
+    #### TODO To load data function
     tforms = tv_transforms.Compose([
         lambda x : rescale_to(x, to=(-1,1)),
         tv_transforms.GaussianBlur(5, sigma=2.0)
@@ -158,7 +179,9 @@ def main():
             raw_transforms=tforms,
             joint_transforms=tforms_joint,
             apply_joint_first=False)
+    ####
 
+    #### TODO To load model type function, parametrized for resto somehow
     model_diag = load_model(args.path_diag, map_location=torch.device(device_name), 
             pretrained_mean=False)
     # Wrap around the diag model to change the diagonal vector prediciton into
@@ -169,14 +192,32 @@ def main():
             pretrained_mean=False)
     # Does not matter which model is taken as the L2 model, both have equally
     # good mean predictors, and the covariance is an identity.
-    model_l2_fwd = L2_model_wrap(model_supn)
+    model_l2_fwd = L2_model_wrap(FL_FIXED_VAR, model_supn)
 
-    scoring_func = lambda x_mu, x_chol, x, mask : scoring_func_outliers(
-            x_mu, x_chol, x, mask, TILE_FACTOR)
+    scoring_func = lambda x_mu, x_chol, x, mask, conn : scoring_func_outliers(
+            x_mu, x_chol, x, mask, TILE_FACTOR, conn=conn)
 
     model_resto_supn = Restoration_model_wrap(model_supn)
     model_resto_diag = Restoration_model_wrap(model_diag_fwd)
     model_resto_l2 = Restoration_model_wrap(model_l2_fwd)
+    ####
+
+    # For restoration-based methods there is no sampling because the z becomes
+    # an optimized point estimate (samples = 1).
+    metrics_resto_supn = vae_model_scoring(dset_healthy, dset_infected, 
+                model_resto_supn, scoring_func, device=device_name, samples=1, model_label="SUPN (Restoration)")
+    metrics_resto_l2 = vae_model_scoring(dset_healthy, dset_infected, 
+                model_resto_l2, scoring_func, device=device_name, samples=1, model_label="L2 (Restoration)")
+    metrics_resto_diag = vae_model_scoring(dset_healthy, dset_infected, 
+                model_resto_diag, scoring_func, device=device_name, samples=1, model_label="Diag (Restoration)")
+    ############## /TODO
+
+    # TODO Check if below is necessary
+    plt.legend()
+    plt.title("ROC Curve")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.show()
 
     # Sampling is done for non-restorative methods (samples > 1).
     metrics_supn = vae_model_scoring(dset_healthy, dset_infected, 
@@ -185,15 +226,6 @@ def main():
             model_diag_fwd, scoring_func, device=device_name, samples=100)
     metrics_l2 = vae_model_scoring(dset_healthy, dset_infected, 
             model_l2_fwd, scoring_func, device=device_name, samples=100)
-
-    # For restoration-based methods there is no sampling because the z becomes
-    # an optimized point estimate (samples = 1).
-    metrics_resto_supn = vae_model_scoring(dset_healthy, dset_infected, 
-                model_resto_supn, scoring_func, device=device_name, samples=1)
-    metrics_resto_diag = vae_model_scoring(dset_healthy, dset_infected, 
-                model_resto_diag, scoring_func, device=device_name, samples=1)
-    metrics_resto_l2 = vae_model_scoring(dset_healthy, dset_infected, 
-                model_resto_l2, scoring_func, device=device_name, samples=1)
 
     metrics = {
             'resto_supn' : metrics_resto_supn,
