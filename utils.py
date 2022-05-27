@@ -5,6 +5,8 @@ import os
 import time
 from pathlib import Path
 
+from tqdm.auto import tqdm
+
 import torch
 import torchvision.transforms as tv_transforms
 import numpy as np
@@ -14,7 +16,7 @@ from scipy.ndimage.morphology import distance_transform_edt
 
 from torch.nn import functional as F
 
-from transforms import SigmoidScaleShift
+from transforms import SigmoidScaleShift, rescale_to
 from model_blocks import (DiagChannelActivation,
         IPE_autoencoder_mu_l)
 
@@ -383,11 +385,14 @@ def conn_to_nonzeros(conn):
 
 class Restoration_model_wrap:
 
-    def __init__(self, model, step=0.01, n_steps=100):
+    def __init__(self, model, step=0.01, n_steps=100, objective="mah"):
         self.model = model
         self.connectivity = model.connectivity
         self.step = step
         self.n_steps = n_steps
+        self.objective = objective
+
+        self.deltas = [] # TODO Remove
 
     def zero_grad(self):
         self.model_diag.zero_grad()
@@ -395,6 +400,7 @@ class Restoration_model_wrap:
     def optimize_z(self, dpoint, model, step=0.01, n_steps=100):
         r"""
         """
+        self.deltas = [] # TODO Remove
         conn = self.connectivity
 
         x_mu, x_chol, z_mu, z_logvar = model(dpoint)
@@ -408,16 +414,29 @@ class Restoration_model_wrap:
         z_.requires_grad = True
 
         optimizer = torch.optim.Adam([z_], lr=step)
-        deltas = []
+        obj_prev = None
         for step_idx in range(n_steps):
             x_mu = model.mu_decoder(z_)
             x_chol = model.var_decoder(z_)
-            mah = mahalanobis_dist(dpoint, x_mu, x_chol, conn=conn)
-            mah.sum().backward()
+            # NLL objective to optimize
+            if self.objective == 'nll':
+                obj = -get_log_prob_from_sparse_L_precision(
+                    dpoint, x_mu, self.connectivity,
+                    x_chol[:,0,...].unsqueeze(1),
+                    x_chol[:,1:,...]) 
+            elif self.objective == 'mah':
+                obj = mahalanobis_dist(dpoint, x_mu, x_chol, conn=conn)
+            obj.sum().backward()
+            #z_prev = z_.detach().data.clone()
             optimizer.step()
-            with torch.no_grad():
-                deltas.append((z_.grad * step).square().sum())
             optimizer.zero_grad()
+
+            with torch.no_grad():
+                #self.deltas.append((z_ - z_prev).norm().item())
+                if obj_prev is not None:
+                    self.deltas.append((obj_prev - obj.sum()).item())
+
+            obj_prev = obj.detach().sum().data.clone() # TODO For plotting mahalanobis changes.
 
         return z_.detach()
 
@@ -429,7 +448,7 @@ class Restoration_model_wrap:
         model = self.model
         conn = self.connectivity
 
-        z_optim = self.optimize_z(x, model)
+        z_optim = self.optimize_z(x, model, step=self.step, n_steps=self.n_steps)
         x_mu = model.mu_decoder(z_optim)
         x_chol = model.var_decoder(z_optim)
 
@@ -457,6 +476,9 @@ class ModelWrapper:
     
     def select_z(self, z_mu, z_logvar):
         raise NotImplementedError
+
+    def reparametrize(self, z_mu, z_var):
+        return self.model.reparametrize(z_mu, z_var)
 
     def __call__(self, x):
         r"""
@@ -513,6 +535,11 @@ class Diag_model_wrap(ModelWrapper):
 
 class L2_model_wrap(ModelWrapper):
 
+    def __init__(self, fixed_var, model, **kwargs):
+        super().__init__(model, **kwargs)
+
+        self.fixed_var = torch.Tensor([fixed_var])
+
     def mu_decoder(self, z):
         return self.model.mu_decoder(z)
 
@@ -538,13 +565,16 @@ class L2_model_wrap(ModelWrapper):
         device = z.device
         nonzeros = conn_to_nonzeros(conn)
         x_chol = torch.zeros(B, nonzeros, H, W).to(device)
+        # In case of a fixed non-unit variance (scaled spherical model). If 
+        # fixed_var = 1 then the diagonal will also be 0.
+        x_chol[:,0] = -0.5 * torch.log(self.fixed_var)
 
         # Here x_logvar is completely discarded. It doesn't matter if the model was
         # trained to predict something meaningful there or not.
         return x_chol
 
 def run_through_vae_restoration(input_images, model_l2, model_diag, model_chol,
-        fixed_var, DEVICE=0, return_means=False, return_chols=False, 
+        DEVICE=0, return_means=False, return_chols=False, 
         return_diag_logvar=False):
     r"""
     Calculate the Mahalanobis distances using a restoration-based method.
@@ -632,3 +662,133 @@ def get_ellipsoid_noise(out_shape, center, a=10., b=5., angle=0.3,
     pattern[mask] = random_sample
 
     return pattern
+
+def run_through_vae_qzsampled(input_images, model_l2, model_diag, model_chol, 
+        DEVICE=0, n_samples=100, return_means=False, return_chols=False):
+    r"""
+    Args:
+        :input_images: torch.Tensor [Test points, 1, H, W]
+    """
+    assert len(input_images.shape) == 4,\
+            "Got {} need [TP, 1, H, W]".format(input_images.shape)
+
+    model_connectivity = model_chol.connectivity
+
+    TEST_POINTS, _, H, W = input_images.shape
+
+    num_chol_ch = model_chol.num_nonzero_elems
+
+    ####
+    def get_mahalanobis_mean_chol(input_images, model):
+        r"""
+        Record the outputs of the model along with the computed mahalanobis
+        distance (not averaged spatially).
+        """
+        Mahs = torch.zeros(TEST_POINTS, 1, H, W)
+        Means = torch.zeros(TEST_POINTS, 1, H, W)
+        Chols = torch.zeros(TEST_POINTS, num_chol_ch, H, W)    
+
+        for tpidx in tqdm(range(TEST_POINTS), desc="Sampling for testpoints..."):
+            with torch.no_grad():
+                inp_ = input_images[tpidx].to(DEVICE).unsqueeze(0)
+                z_mu, z_logvar = model.encoder(inp_)
+
+                Mahs_samp_hw = torch.zeros(n_samples, 1, H, W)
+                Means_samp_hw = torch.zeros(n_samples, 1, H, W)
+                Chols_samp_hw = torch.zeros(n_samples, num_chol_ch, H, W)
+
+                for spidx in range(n_samples):
+                    rep_ = model.reparametrize(z_mu, z_logvar.exp())
+
+                    x_mu = model.mu_decoder(rep_)
+                    x_chol = model.var_decoder(rep_)
+
+                    Means_samp_hw[spidx] = x_mu[0]
+                    Chols_samp_hw[spidx] = x_chol[0]
+                    Mahs_samp_hw[spidx] = mahalanobis_dist(
+                                inp_.to(DEVICE), 
+                                x_mu.to(DEVICE), 
+                                x_chol.to(DEVICE),
+                                conn=model_connectivity)
+
+            Mahs[tpidx] = Mahs_samp_hw.mean(0)
+            Means[tpidx] = Means_samp_hw.mean(0)
+            Chols[tpidx] = Chols_samp_hw.mean(0)
+
+        return Mahs, Means, Chols
+                    
+    ####
+
+    Mahs_L2, Means_L2, _ = get_mahalanobis_mean_chol(input_images, model_l2)
+    Mahs_Diag, _, _ = get_mahalanobis_mean_chol(input_images, model_diag)
+    Mahs_SUPN, _, Chols_SUPN = get_mahalanobis_mean_chol(input_images, model_chol)
+
+    if return_chols:
+        return Mahs_L2, Mahs_Diag, Mahs_SUPN, Means_L2, Chols_SUPN
+    if return_means:
+        return Mahs_L2, Mahs_Diag, Mahs_SUPN, Means_L2
+    else:
+        return Mahs_L2, Mahs_Diag, Mahs_SUPN
+
+#    print("assigning zeros")
+#    L2 = torch.zeros(TEST_POINTS, 1 , H, W)
+#    Diag = torch.zeros(TEST_POINTS, 1, H, W)
+#    Lr = torch.zeros(TEST_POINTS, 1, H, W)
+#    means = torch.zeros(TEST_POINTS, 1, H, W)
+#    chols = torch.zeros(TEST_POINTS, num_chol_ch, H, W)
+#    for tpidx in tqdm(range(TEST_POINTS), desc="vae.."):
+#        with torch.no_grad():
+#            inp_ = input_images[tpidx].to(DEVICE).unsqueeze(0)
+#            z_mu_diag, z_logvar_diag = model_diag.encoder(inp_)
+#            z_mu_chol, z_logvar_chol = model_chol.encoder(inp_)
+#
+#            L2_samp_hw = torch.zeros(n_samples, 1 , H, W)
+#            Diag_samp_hw = torch.zeros(n_samples, 1, H, W)
+#            Lr_samp_hw = torch.zeros(n_samples, 1, H, W)
+#            Means_samp_hw = torch.zeros(n_samples, 1, H, W)
+#            Diag_logvar_samp_hw = torch.zeros(n_samples, 1, H, W)
+#            Chols_samp_hw = torch.zeros(n_samples, num_chol_ch, H, W)
+#            for spidx in range(n_samples):
+#                # Encodings should be the same for the same image since the encoder
+#                # and the mu-decoder are shared.
+#
+#                # TODO For [model l2, model diag, model supn] calculate metric...
+#                rep_chol_ = model_chol.reparametrize(z_mu_chol, z_logvar_chol.exp())
+#                rep_diag_ = model_diag.reparametrize(z_mu_diag, z_logvar_diag.exp())
+#                x_mu_chol_ = model_chol.mu_decoder(rep_chol_)
+#                x_var_chol_ = model_chol.var_decoder(rep_chol_)
+#                x_mu_diag_ = model_diag.mu_decoder(rep_diag_)
+#                x_var_diag_ = model_diag.var_decoder(rep_diag_)[:,0].unsqueeze(1)
+#
+#                resid_chol_tmp_ = inp_ - x_mu_chol_.to(DEVICE)
+#                resid_diag_tmp_ = inp_ - x_mu_diag_.to(DEVICE)
+#
+#                # Save sampled 
+#                Chols_samp_hw[spidx] = x_var_chol_
+#                Means_samp_hw[spidx] = (x_mu_diag_ + x_mu_chol_)/2 # diag and chol should have the same decoder
+#                Diag_logvar_samp_hw[spidx] = x_var_diag_
+#                L2_samp_hw[spidx] = resid_chol_tmp_.square()
+#                Diag_samp_hw[spidx] = resid_diag_tmp_.square() * (1/x_var_diag_.exp())
+#                Lr_samp_hw[spidx] = mahalanobis_dist(
+#                            inp_.to(DEVICE), 
+#                            x_mu_chol_.to(DEVICE), 
+#                            x_var_chol_.to(DEVICE),
+#                            conn=model_connectivity)
+#
+#            # Take mean of the summary statistics. Same as 'integrating' over 
+#            # the Qz distribution (latent space).
+#            L2[tpidx] = L2_samp_hw.mean(0)
+#            Diag[tpidx] = Diag_samp_hw.mean(0)
+#            Lr[tpidx] = Lr_samp_hw.mean(0)
+#            means[tpidx] = Means_samp_hw.mean(0)
+#            chols[tpidx] = Chols_samp_hw.mean(0)
+
+    # TODO Check that the results of both codes look similar at least visually.
+    import pdb; pdb.set_trace()
+
+    if return_chols:
+        return L2, Diag, Lr, means, chols
+    if return_means:
+        return L2, Diag, Lr, means
+    else:
+        return L2, Diag, Lr
