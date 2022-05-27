@@ -26,51 +26,6 @@ import numpy as np
 
 torch.autograd.set_detect_anomaly(True)
 
-class TruncatedList:
-    r"""
-    A list that has a max length and will discard the oldest element when a new
-    one is added and the max length reached. Used for keeping track of the
-    latest loss values.
-    """
-    def __init__(self, max_len):
-        super().__init__()
-
-        self.max_len = max_len
-        self.list = []
-
-    def append(self, x):
-        r"""
-        Adds element to the end of the list and pops the first element (oldest
-        added) if the maximum length is reached.
-        """
-        if len(self.list) >= self.max_len:
-            self.list.pop(0) 
-
-        self.list.append(x)
-
-    def max_len_reached(self):
-        return len(self.list) == self.max_len
-
-    def mean(self):
-        r"""
-        Return the mean of the elements in the stored list, going through a np
-        array in the process.
-        """
-        # Call .item() to return a python float instead of numpy.
-        return self.numpy().mean().item()
-
-    def numpy(self):
-        r"""
-        Returns a numpy array copy of the list.
-        """
-        return np.array(self.list)
-
-    def torch(self):
-        r"""
-        Returns a torch tensor copy of the list (1D tensor).
-        """
-        return torch.Tensor(self.list)
-
 TRAINING_STOP_REASONS = {
     0 : "Max iterations exceeded",
     1 : "Loss values condition is met",
@@ -90,7 +45,6 @@ class LoggingFunctionWrapper:
         self.logger = logger
         self.stopping_threshold = stopping_threshold
         self.sliding_window_size = sliding_window_size
-        self.losses_list =  TruncatedList(sliding_window_size)
         self.current_criterion_estimate = None
         self.variance_threshold = local_minimum_detection_threshold
 
@@ -111,12 +65,6 @@ class LoggingFunctionWrapper:
 
         return pixelwise_variance < self.variance_threshold
 
-    def check_loss_criterion(self):
-        new_criterion_estimate = self.losses_list.mean()
-        abs_diff_ = abs(new_criterion_estimate - self.current_criterion_estimate)
-        self.current_criterion_estimate = new_criterion_estimate
-        return abs_diff_ < self.stopping_threshold
-
     def calculate_stopping_criterion(self, model, it):
         r"""
         Return int if any stopping criterion is met, or None if not.
@@ -129,21 +77,10 @@ class LoggingFunctionWrapper:
             # We don't check on every iteration for efficiency
             return None
 
-        elif self.current_criterion_estimate is None:
-            # Initialize the stop criterion
-            self.current_criterion_estimate = self.losses_list.mean()
-            return None
-
         else:
             local_minimum_criterion_stop_ = self.check_for_local_minimum(model)
-            loss_criterion_stop_ = self.check_loss_criterion()
 
-            if loss_criterion_stop_:
-                self.logger.info("Loss abs delta low enough.. stop: {}".format(loss_criterion_stop_))
-                # Training stop reason 1 is that the loss criterion is met
-                return 1 
-
-            elif local_minimum_criterion_stop_:
+            if local_minimum_criterion_stop_:
                 self.logger.info("Reached local minimum...")
                 # Training stop reason 2 is that the model has likely reached
                 # a local minimum that it likely won't escape.
@@ -182,8 +119,6 @@ class LoggingFunctionWrapper:
         the training was stopped.
         """
         self.log(model, loss, it, log_image, device=device)
-        # The following list won't exceed the sliding window size.
-        self.losses_list.append(loss)
         return self.calculate_stopping_criterion(model, it)
 
 def logging_function(decoders, loss, iteration, summary_writer, log_image=False):
