@@ -4,7 +4,9 @@ from utils import (
         load_model,
         L2_model_wrap,
         Diag_model_wrap,
-        Restoration_model_wrap)
+        Restoration_model_wrap,
+        mahalanobis_dist,
+        get_log_prob_from_sparse_L_precision)
 from models import run, TRAINING_STOP_REASONS, get_random_latent_sample
 from tqdm.auto import tqdm
 from sklearn.model_selection import ParameterGrid
@@ -14,14 +16,17 @@ import yaml
 import os
 import torchvision.transforms as tv_transforms
 from dataset import FullFrames
-from evaluate_fl import vae_model_scoring
+from evaluate_fl import (
+        vae_model_scoring, 
+        vae_dataset_likelihood, 
+        scoring_func_outliers)
 from transforms import rescale_to
 import pandas as pd
 import imageio
 import torch
 import matplotlib.pyplot as plt
 
-from structured_uncertainty.new_sparse_supn_sampler import apply_sparse_solve_sampling
+from new_sparse_supn_sampler import apply_sparse_solve_sampling
 from pylatex import Document, NoEscape, Figure
 
 params = {
@@ -30,8 +35,14 @@ params = {
         "ENCODING_DIMENSION": int,
         "LEARNING_RATE" : float,
         "FIXED_VAR" : float,
-        "STOPPING_THRESHOLD" : float,
         "SLIDING_WINDOW_SIZE" : int
+        }
+
+params_eval = {
+        "healthy_test_raw" : str,
+        "healthy_test_mask" : str,
+        "infected_raw" : str,
+        "infected_mask" : str
         }
 
 def log_and_save(conf, logger=None, training_outcome=None):
@@ -138,9 +149,12 @@ def get_healthy_infected_dsets(
 
     return dset_healthy, dset_infected
 
-def update_doc_with_images(model, doc, n_samples=5, caption=None):
+def update_doc_with_samples(model, doc, n_samples=5, caption=None):
+    r"""
+    Add visualization images to the pdf doc.
 
-    n_samples = 5
+    1. Random latent sample decoded into the observation space.
+    """
     mu_samples, chol_samples = get_random_latent_sample(model, n=n_samples)
     device = mu_samples.device
 
@@ -159,21 +173,71 @@ def update_doc_with_images(model, doc, n_samples=5, caption=None):
     with doc.create(Figure()) as sample_illustration:
         fig, axes = plt.subplots(1,len(samples))
         for idx, sample in enumerate(samples):
-            axes[idx].imshow(sample[0].cpu())
+            ax = axes[idx]
+            im = ax.imshow(sample[0].cpu())
+            fig.colorbar(im, ax=ax)
 
         sample_illustration.add_plot()
 
         if caption is not None:
             sample_illustration.add_caption(caption)
 
-def save_pdf_report(report_dir, doc):
+def update_doc_with_reconstructions(
+        model, dset, doc, n_images=5, 
+        caption=None, device=0, dset_idx_offset=0):
     r"""
+    Reconstruct a number of images and show Mahalanobis distance, diagonal of L
+    and the log-likelihood.
     """
-    timestamp_ = get_timestamp_string()
-    output_dir_name = "{}_{}".format(timestamp_, report_dir)
-    make_dirs_if_absent([output_dir_name])
+    with doc.create(Figure()) as rec_fig:
 
-    doc.generate_pdf("{}/report".format(output_dir_name))
+        fig, axes = plt.subplots(n_images, 4)
+
+        with torch.no_grad():
+
+            for idx in range(n_images):
+                dpoint, mask = dset[idx + dset_idx_offset]
+                dpoint = dpoint[None,].to(device)
+
+                x_mu, x_chol, _, _ = model(dpoint)
+
+                # [1,1,H,W]
+                log_l_ = get_log_prob_from_sparse_L_precision(
+                        dpoint, 
+                        x_mu, 
+                        model.connectivity,
+                        x_chol[:,0,None],
+                        x_chol[:,1:],
+                        pixelwise=True)
+
+                mah_ = mahalanobis_dist(
+                        dpoint, 
+                        x_mu, 
+                        x_chol, 
+                        conn=model.connectivity)
+
+                ax0 = axes[idx, 0]
+                im0 = ax0.imshow(dpoint[0,0].cpu()) 
+                ax0.set_title("Raw")
+                fig.colorbar(im0, ax=ax0)
+
+                ax1 = axes[idx, 1]
+                im1 = ax1.imshow(mah_[0,0].cpu()) 
+                ax1.set_title("Mah")
+                fig.colorbar(im1, ax=ax1)
+
+                ax2 = axes[idx, 2]
+                im2 = ax2.imshow(log_l_[0,0].cpu()) 
+                ax2.set_title("Log l")
+                fig.colorbar(im2, ax=ax2)
+
+                ax3 = axes[idx, 3]
+                im3 = ax3.imshow(x_chol[0,0].cpu()) 
+                ax3.set_title("Chol diag")
+                fig.colorbar(im3, ax=ax3)
+
+        rec_fig.add_plot()
+        rec_fig.add_caption(caption)
 
 def summarize_gridsearch_performance(
         path_healthy_raw, path_healthy_gt,
@@ -193,8 +257,6 @@ def summarize_gridsearch_performance(
     so they are not present in the config file and we have to pass their paths
     as parameters.
     """
-    from evaluate_fl import scoring_func_outliers
-
     config_paths = []
 
     scoring_func = lambda x_mu, x_chol, x, mask, conn : scoring_func_outliers(
@@ -214,6 +276,8 @@ def summarize_gridsearch_performance(
     # Metrics lists
     aurocs = []
     auprcs = []
+    logl_hs = []
+    logl_is = []
 
     doc = Document()
 
@@ -231,10 +295,17 @@ def summarize_gridsearch_performance(
                 map_location="cuda:{}".format(device), restoration=restoration,
                 l2_fixed_var=l2_fixed_var)
 
+        # Add likelihood to lists for dataframe.
+        dset_likelihood_healthy = vae_dataset_likelihood(dset_healthy, model)
+        dset_likelihood_infected = vae_dataset_likelihood(dset_infected, model)
+        logl_hs.append( dset_likelihood_healthy )
+        logl_is.append( dset_likelihood_infected )
+
+        # Classification metrics
         metrics = vae_model_scoring(dset_healthy, dset_infected,
             model, scoring_func, device=device, samples=samples,
             model_label="{}, Resto: {}".format(model_type, restoration))
-
+        
         # Add relevant model parameters from the config file.
         for param_name in params.keys():
             grid_params[param_name].append(config_dict[param_name])
@@ -243,17 +314,39 @@ def summarize_gridsearch_performance(
         aurocs.append(metrics['auroc'])
         auprcs.append(metrics['auprc'])
 
-        update_doc_with_images(model, doc, n_samples=5, caption=config_path)
+        update_doc_with_samples(model, doc, n_samples=5, 
+                caption="Random samples of {}".format(config_path))
+        update_doc_with_reconstructions(model, dset_healthy, doc, n_images=5, 
+                caption="Healthy reconstructions of {}".format(config_path))
+        update_doc_with_reconstructions(model, dset_infected, doc, n_images=5, 
+                caption="Infected reconstructions of {}".format(config_path))
+
 
     grid_params['auroc'] = aurocs
     grid_params['auprc'] = auprcs
+    grid_params['logl_healthy'] = logl_hs
+    grid_params['logl_infected'] = logl_is
     df_results = pd.DataFrame(grid_params)
 
+    with doc.create(Figure()) as scatter_fig:
+        pd.plotting.scatter_matrix(df_results[[
+            "auroc", 
+            "auprc", 
+            "logl_healthy", 
+            "logl_infected",
+            "ENCODING_DIMENSION"]])
+
+        scatter_fig.add_plot()
+        scatter_fig.add_caption("Scatter plot for experiment, interested in how \
+                likelihood, discriminative performance and the bottleneck size\
+                affect each other.")
+        
     # Evaluation seems to work sensibly.
     print(df_results)
-    # Add metrics table as formatted by pandas (latex code).
-    doc.append( NoEscape(df_results.to_latex()) )
-    save_pdf_report("test_report", doc)
+    # Output metrics as csv table. Easier to format than latex..
+    df_results.to_csv(path_or_buf="{}/result_table.csv".format(root_folder))
+    # Save to the experiment root folder.
+    doc.generate_pdf("{}/report".format(root_folder))
 
 def main():
 
@@ -266,6 +359,15 @@ def main():
                 type=ptype, 
                 nargs="+",
                 help="(possibly empty) parameter list.", 
+                required=False)
+
+    # Add parameters for the experiment summary running mode. For example, the
+    # location of the healthy holdout and infected test data, which are not in
+    # the config file.
+    for param, ptype in params_eval.items():
+        parser.add_argument("--{}".format(param),
+                type=ptype,
+                help="Optional param for when running in eval mode.",
                 required=False)
 
     # Add misc parameters (folder naming, initial yaml config, ...)
@@ -300,19 +402,26 @@ def main():
     args = parser.parse_args()
 
     if args.summarize_experiment is not None:
-        # Hardcoded path to test datasets, should it be parmeteric instead?
-        PATH_HEALTHY_RAW = "/u/homes/biv20/repos/unsupervised_cells_supn/fl_dataset/healthy_test/raw"
-        PATH_HEALTHY_GT = "/u/homes/biv20/repos/unsupervised_cells_supn/fl_dataset/healthy_test/mask"
-        PATH_INFECTED_RAW = "/u/homes/biv20/repos/unsupervised_cells_supn/fl_dataset/infected/raw"
-        PATH_INFECTED_GT = "/u/homes/biv20/repos/unsupervised_cells_supn/fl_dataset/infected/mask"
+        #PATH_HEALTHY_RAW = "/u/homes/biv20/repos/unsupervised_cells_supn/fl_dataset/healthy_test/raw"
+        #PATH_HEALTHY_GT = "/u/homes/biv20/repos/unsupervised_cells_supn/fl_dataset/healthy_test/mask"
+        #PATH_INFECTED_RAW = "/u/homes/biv20/repos/unsupervised_cells_supn/fl_dataset/infected/raw"
+        #PATH_INFECTED_GT = "/u/homes/biv20/repos/unsupervised_cells_supn/fl_dataset/infected/mask"
+
+        PATH_HEALTHY_RAW = args.healthy_test_raw
+        PATH_HEALTHY_GT = args.healthy_test_mask
+        PATH_INFECTED_RAW = args.infected_raw
+        PATH_INFECTED_GT = args.infected_mask
+
         TILE_FACTOR=2
 
-        summary_table = summarize_gridsearch_performance(
+        summarize_gridsearch_performance(
                 PATH_HEALTHY_RAW, PATH_HEALTHY_GT,
                 PATH_INFECTED_RAW, PATH_INFECTED_GT,
                 root_folder=args.summarize_experiment,
                 restoration=args.restoration,
                 TILE_FACTOR=TILE_FACTOR)
+
+        return
 
     # Initialize config from the passed yaml file.
     conf_path = args.common_params_yaml
