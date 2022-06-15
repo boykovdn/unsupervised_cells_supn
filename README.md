@@ -9,6 +9,17 @@ This work is licensed under a
 [cc-by]: http://creativecommons.org/licenses/by/4.0/
 [cc-by-image]: https://i.creativecommons.org/l/by/4.0/88x31.png
 
+## Setup
+
+Use the environment file:
+
+```shell
+conda env create -f environment.yml
+```
+
+You might have to manually specify the cudatoolkit version, if you are using 
+a newer Nvidia GPU (such as RTX3090).
+
 ## Training
 
 This repository can be used to reproduce the results in the paper, but it can
