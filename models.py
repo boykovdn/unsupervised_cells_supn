@@ -34,8 +34,8 @@ TRAINING_STOP_REASONS = {
 
 class LoggingFunctionWrapper:
 
-    def __init__(self, summary_writer, stopping_threshold, sliding_window_size,
-            logging_dset, local_minimum_detection_threshold=1e-8, logger=None):
+    def __init__(self, summary_writer, logging_dset, log_frequency=100,
+            local_minimum_detection_threshold=1e-8, logger=None):
 
         super().__init__()
 
@@ -43,8 +43,7 @@ class LoggingFunctionWrapper:
 
         self.dset = logging_dset
         self.logger = logger
-        self.stopping_threshold = stopping_threshold
-        self.sliding_window_size = sliding_window_size
+        self.log_frequency = 100
         self.current_criterion_estimate = None
         self.variance_threshold = local_minimum_detection_threshold
 
@@ -69,9 +68,8 @@ class LoggingFunctionWrapper:
         r"""
         Return int if any stopping criterion is met, or None if not.
         """
-        # Check if stopping criterion is met only once all elements in
-        # the losses list have been replaced:
-        proceed_with_calculation = it % self.sliding_window_size
+        # Don't calculate stopping criterion on every iteration for speed.
+        proceed_with_calculation = it % self.log_frequency
 
         if not proceed_with_calculation:
             # We don't check on every iteration for efficiency
@@ -301,8 +299,6 @@ def run(conf_, logger=None):
     TRAINING_TYPE = conf_['TRAINING_TYPE']
     FIXED_VAR = conf_['FIXED_VAR']
 
-    STOPPING_THRESHOLD = conf_['STOPPING_THRESHOLD']
-    SLIDING_WINDOW_SIZE = conf_['SLIDING_WINDOW_SIZE']
     LOCAL_MINIMUM_DETECTION_THRESHOLD = conf_['LOCAL_MINIMUM_DETECTION_THRESHOLD']
 
     DEBUG = False # Loads a small subset of the training data.
@@ -336,8 +332,6 @@ def run(conf_, logger=None):
     # Logging object adds losses to tensorboard and calculates when to stop.
     logging_object = LoggingFunctionWrapper(
             summary_writer, 
-            STOPPING_THRESHOLD, 
-            SLIDING_WINDOW_SIZE,
             dset,
             local_minimum_detection_threshold=LOCAL_MINIMUM_DETECTION_THRESHOLD,
             logger=logger)
