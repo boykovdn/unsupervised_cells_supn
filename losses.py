@@ -1,8 +1,8 @@
 import torch
 import numpy as np
-from structured_uncertainty.jacobi_sampler import (
-                            get_log_prob_from_sparse_L_precision,
-                            apply_sparse_chol_rhs_matmul)
+from utils import (
+                  get_log_prob_from_sparse_L_precision,
+                  apply_sparse_chol_rhs_matmul)
 from torchvision.transforms import Resize
 
 def kl_divergence_unit_normal(mu, logvar):
