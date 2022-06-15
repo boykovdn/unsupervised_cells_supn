@@ -8,7 +8,8 @@ from utils import (
         Diag_model_wrap,
         Restoration_model_wrap,
         conn_to_nonzeros,
-        load_model)
+        load_model,
+        get_log_prob_from_sparse_L_precision)
 from tqdm.auto import tqdm
 import numpy as np
 from transforms import (rescale_to, SigmoidScaleShift)
@@ -56,6 +57,32 @@ def scoring_table(true_labels, predicted_labels, plot_curves=False, model_label=
         #plt.plot(precision, recall, color="orange")
 
     return metrics
+
+def vae_dataset_likelihood(dset, model, device=0):
+    r"""
+    Calculate the likelihood of the dataset under the model. The likelihood of
+    X is the sum of the likelihoods of the individual datapoints.
+
+    Inputs:
+        :dset: Dataset object
+        :model: VAE generative model outputs distribution parameters.
+        :device: int
+    """
+    total_log_l = 0
+
+    for dpoint,mask in tqdm(dset, desc="Calculating dataset likelihood..."):
+        dpoint = dpoint[None,].to(device)
+
+        x_mu, x_chol, _, _ = model(dpoint)
+
+        total_log_l += get_log_prob_from_sparse_L_precision(
+                dpoint,
+                x_mu,
+                model.connectivity,
+                x_chol[:,0,None,],
+                x_chol[:,1:]).detach().item() / len(dset)
+
+    return total_log_l
 
 def vae_model_scoring(dset_n, dset_a, model, scoring_func, device=0,
         samples=100, model_label=None):
