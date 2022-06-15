@@ -3,7 +3,7 @@ import imageio
 import os
 import numpy as np
 from tqdm.auto import tqdm
-from structured_uncertainty.transforms import rescale_to
+from transforms import rescale_to
 from scipy.ndimage.morphology import distance_transform_edt
 
 from torchvision.transforms import Resize
