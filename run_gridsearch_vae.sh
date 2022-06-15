@@ -1,11 +1,9 @@
 python gridsearch_experiment.py \
 	--L1_REG_WEIGHT 0 \
-	--DEPTH 4 5 6\
-	--ENCODING_DIMENSION 100 200 300 \
+	--DEPTH 5\
+	--ENCODING_DIMENSION 20 100 200 300 500 1000 \
 	--LEARNING_RATE 0.001 \
 	--FIXED_VAR 0.06 \
-	--STOPPING_THRESHOLD 0.00000001 \
-	--SLIDING_WINDOW_SIZE 2000 \
 	--local_minimum_detection_threshold 0.00000001 \
-	--experiment_tag test \
-	--common_params_yaml test.yaml
+	--experiment_tag logl_peak \
+	--common_params_yaml gridsearch_vae.yaml
