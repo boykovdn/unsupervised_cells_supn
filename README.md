@@ -13,7 +13,8 @@ This work is licensed under a
 ## Training
 
 This repository can be used to reproduce the results in the paper, but it can
-also be used for experimenting on different data.
+also be used for experimenting on different data. The dataset can be found at
+https://zenodo.org/record/6645803
 
 The training is done in two stages, first run:
 
