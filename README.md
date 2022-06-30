@@ -1,5 +1,6 @@
-# unsupervised_cells_supn
-Experiments, evaluation, and models for "Cell Anomaly Localisation using Structured Uncertainty Prediction Networks"
+# Experiments, evaluation, and models for the MIDL 2022 entry "Cell Anomaly Localisation using Structured Uncertainty Prediction Networks".
+
+Please get in touch if you run into problems using this code. The repository is still a work in progress and contains areas of active development.
 
 This work is licensed under a
 [Creative Commons Attribution 4.0 International License][cc-by].
